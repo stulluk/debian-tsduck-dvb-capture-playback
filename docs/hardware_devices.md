@@ -68,10 +68,11 @@ usb 5-2.4: 734c:5530 TBS (no strings)
 
 ## Driver / firmware requirements (to be validated)
 
-| Device    | Candidate driver                              | Firmware                | Source / standard |
-| --------- | --------------------------------------------- | ----------------------- | ----------------- |
-| DTU-315   | `dektec-dkms` (Dtu.ko, out-of-tree DKMS)      | uploaded by driver      | DVB-S/S2/T/T2/C   |
-| TBS5530   | `koreapyj/cxd28xx` (cxd2878 + m88rs6060, DKMS)| `dvb-usb-id5530.fw`     | DVB-T/T2/C/S/S2   |
-| PCTV 461  | likely mainline `em28xx` (em28178 bridge)?    | demod fw (e.g. m88ds3103)| DVB-S2 (TBC)     |
+| Device    | Driver                                        | Firmware                 | Status        |
+| --------- | --------------------------------------------- | ------------------------ | ------------- |
+| DTU-315   | Dektec **LinuxSDK** `Dtu.ko` (DKMS)           | uploaded by driver (FX3) | driver OK (L1)|
+| TBS5530   | `koreapyj/cxd28xx` (cxd2878 + m88rs6060, DKMS)| `dvb-usb-id5530.fw`      | pending       |
+| PCTV 461  | likely mainline `em28xx` (em28178 bridge)?    | demod fw (e.g. m88ds3103)| pending       |
 
-These are candidates only; each must be verified against the running 7.0.0 kernel.
+DTU-315 is verified at driver level (see driver_bringup.md). The other two are
+candidates and must be verified against the running 7.0.0 kernel.

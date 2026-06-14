@@ -15,6 +15,8 @@ This continues earlier work documented on the author's blog and repositories:
 - [Capture and Playback with TSduck under linux](https://www.drejo.com/blog/tsduck-capture-playback/)
 - [gitlab.com/stulluk/tsduck-capture-playback](https://gitlab.com/stulluk/tsduck-capture-playback) (existing bash scripts)
 - DTU-315 driver notes: [tsduck/dektec-dkms#6](https://github.com/tsduck/dektec-dkms/issues/6)
+  (NOTE: the `tsduck/dektec-dkms` project is now archived/obsolete; use the
+  official Dektec LinuxSDK instead, see Drivers below)
 - TBS5530 out-of-tree driver: [koreapyj/cxd28xx](https://github.com/koreapyj/cxd28xx)
 
 ## Hardware
@@ -22,11 +24,11 @@ This continues earlier work documented on the author's blog and repositories:
 Three USB devices are targeted (see [`docs/hardware_devices.md`](docs/hardware_devices.md)
 for the full inventory and detection evidence):
 
-| Device          | VID:PID     | Role                | Driver path (candidate)          |
-| --------------- | ----------- | ------------------- | -------------------------------- |
-| DTU-315         | `1297:030f` | Playback (modulate) | `dektec-dkms` (out-of-tree DKMS) |
-| TBS5530         | `734c:5530` | Capture + Playback  | `koreapyj/cxd28xx` (DKMS)        |
-| "WinTV-Nova-S2" | `2013:0462` | Capture             | mainline `em28xx`? (to confirm)  |
+| Device          | VID:PID     | Role                | Driver path                        | Status        |
+| --------------- | ----------- | ------------------- | ---------------------------------- | ------------- |
+| DTU-315         | `1297:030f` | Playback (modulate) | Dektec **LinuxSDK** `Dtu` (DKMS)   | driver OK (L1)|
+| TBS5530         | `734c:5530` | Capture + Playback  | `koreapyj/cxd28xx` (DKMS)          | pending       |
+| "WinTV-Nova-S2" | `2013:0462` | Capture             | mainline `em28xx`? (to confirm)    | pending       |
 
 All three are currently connected at **USB 2.0 High Speed (480 Mbps)** through a shared
 hub. The "WinTV-Nova-S2" is rebadged hardware that reports as "PCTV 461" (`2013:0462`),
@@ -86,21 +88,54 @@ These were decided together with the user and are intentionally recorded here.
    (cxd28xx / em28xx)                  (dektec-dkms)
 ```
 
+## Drivers (bring-up)
+
+Full step-by-step bring-up notes with verification are in
+[`docs/driver_bringup.md`](docs/driver_bringup.md).
+
+### DTU-315 (Dektec, USB) - working
+
+Do **not** use the archived `tsduck/dektec-dkms` project. Instead download the
+official **Dektec LinuxSDK** from the Dektec website (DTAPI / SDK downloads):
+
+```
+# 1. Download (version used here: 2026.05.0)
+#    https://www.dektec.com/products/SDK/DTAPI/Downloads/LinuxSDK_v2026.05.0.tar.gz
+tar xzf LinuxSDK_v2026.05.0.tar.gz
+
+# 2. Install only the USB (Dtu) driver into DKMS (needs `dkms` + kernel headers)
+cd LinuxSDK/Drivers
+sudo ./Install_Dtu
+```
+
+The SDK ships its own DKMS install scripts (`Install`, `Install_Dtu`, ...), the
+driver source, and the precompiled DTAPI C++ library under `LinuxSDK/DTAPI/`.
+On this host one small fix was needed: the SDK `Install` script's kernel-headers
+precheck looks for a `build/kernel/` dir that Debian `linux-headers` packages do
+not ship; it was changed to check `build/Makefile` instead. The driver source
+itself compiles cleanly on the 7.0.0 kernel without patches.
+
+Verified: `Dtu` module loads, the DTU-315 firmware is uploaded, and `/dev/Dtu4`
+is created. Functional (playback) verification is deferred to the TSDuck stage.
+
 ## Repository layout
 
 ```
 .
 ├── README.md
 ├── docs/
-│   └── hardware_devices.md     # detected device inventory + evidence
-└── (tsduck-tui/, drivers/, docker/  -- to be added)
+│   ├── hardware_devices.md     # detected device inventory + evidence
+│   └── driver_bringup.md       # step-by-step driver/firmware bring-up + verification
+└── (tsduck-tui/, docker/  -- to be added)
 ```
 
 ## Roadmap
 
 - [x] Detect connected devices, record VID:PID and USB speed
-- [ ] Confirm the "WinTV-Nova-S2" vs "PCTV 461" identity
-- [ ] Bring up each driver on the 7.0.0 kernel (DTU-315, TBS5530, PCTV 461)
+- [x] Confirm the "WinTV-Nova-S2" vs "PCTV 461" identity (confirmed: same unit)
+- [x] DTU-315 driver bring-up on 7.0.0 (Dektec LinuxSDK, `Dtu.ko`, L1 verified)
+- [ ] TBS5530 driver bring-up (cxd28xx)
+- [ ] PCTV 461 / Nova-S2 driver bring-up (em28xx)
 - [ ] Build TSDuck in Docker, deploy portable `tsp` to host
 - [ ] Scaffold `tsduck-tui` (Rust + ratatui)
 - [ ] Implement device detection + driver-state diagnostics
