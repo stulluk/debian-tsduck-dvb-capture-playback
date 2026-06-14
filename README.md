@@ -24,11 +24,14 @@ This continues earlier work documented on the author's blog and repositories:
 Three USB devices are targeted (see [`docs/hardware_devices.md`](docs/hardware_devices.md)
 for the full inventory and detection evidence):
 
-| Device          | VID:PID     | Role                | Driver path                        | Status        |
-| --------------- | ----------- | ------------------- | ---------------------------------- | ------------- |
-| DTU-315         | `1297:030f` | Playback (modulate) | Dektec **LinuxSDK** `Dtu` (DKMS)   | driver OK (L1)|
-| TBS5530         | `734c:5530` | Capture + Playback  | `koreapyj/cxd28xx` (DKMS)          | pending       |
-| "WinTV-Nova-S2" | `2013:0462` | Capture             | mainline `em28xx`? (to confirm)    | pending       |
+| Device          | VID:PID     | Role                | Driver path                        | Status                 |
+| --------------- | ----------- | ------------------- | ---------------------------------- | ---------------------- |
+| DTU-315         | `1297:030f` | Playback (modulate) | Dektec **LinuxSDK** `Dtu` (DKMS)   | driver OK (L1)         |
+| TBS5530         | `734c:5530` | Capture + Playback  | `koreapyj/cxd28xx` (DKMS) + TBS fw | driver OK (L1)         |
+| "WinTV-Nova-S2" | `2013:0462` | Capture             | `em28xx` (needs 461e v3 patch)     | blocked (patch needed) |
+
+(The "WinTV-Nova-S2" unit is a PCTV 461e v3 / em28178 + m88ds3103c; its USB id
+`2013:0462` is not yet in the in-tree `em28xx` table - see Drivers below.)
 
 All three are currently connected at **USB 2.0 High Speed (480 Mbps)** through a shared
 hub. The "WinTV-Nova-S2" is rebadged hardware that reports as "PCTV 461" (`2013:0462`),
@@ -118,6 +121,48 @@ itself compiles cleanly on the 7.0.0 kernel without patches.
 Verified: `Dtu` module loads, the DTU-315 firmware is uploaded, and `/dev/Dtu4`
 is created. Functional (playback) verification is deferred to the TSDuck stage.
 
+### TBS5530 (USB) - working
+
+No mainline driver; uses the out-of-tree [`koreapyj/cxd28xx`](https://github.com/koreapyj/cxd28xx)
+driver via DKMS plus TBS firmware:
+
+```
+git clone --depth 1 https://github.com/koreapyj/cxd28xx.git
+cd cxd28xx && make && sudo dkms add . && sudo dkms install cxd28xx/0.0.1 --force
+# firmware (required):
+curl -fL http://www.tbsdtv.com/download/document/linux/tbs-tuner-firmwares_v1.0.tar.bz2 \
+  | sudo tar -C /lib/firmware/ -jxf -
+sudo modprobe tbs5530
+```
+
+Verified: builds clean on 7.0.0, registers `/dev/dvb/adapter0` with frontend0
+(DVB-T/T2/C/ATSC) and frontend1 (DVB-S/S2/S2X).
+
+### WinTV-Nova-S2 / PCTV 461 - blocked (patch needed)
+
+This unit (`2013:0462`) is a PCTV 461e v3 (em28178 + **m88ds3103c**). The in-tree
+`em28xx` is present but does not have this USB id, and the `m88ds3103c` demod
+revision needs the "Hauppauge 461e v3" patches (submitted to linux-media
+2026-03-17). The demod firmware `dvb-demod-m88ds3103c.fw` is already installed;
+the remaining work is to build patched `em28xx` + `m88ds3103` modules. See
+[`docs/driver_bringup.md`](docs/driver_bringup.md) for the exact options.
+
+## Open design question (to discuss)
+
+Originally we agreed on a **Rust + ratatui TUI** that drives the `tsduck` CLI
+tools as subprocesses. A new option is on the table: since TSDuck also ships a
+**Python API**, build a **local web interface** instead (or in addition) - a
+richer UI in the browser for entering modulation parameters and starting/stopping
+capture/playback, similar to a StreamXpress-style web console.
+
+To decide together (deferred):
+- TUI (ratatui) vs local web UI (e.g. Python/FastAPI + TSDuck Python bindings,
+  or Rust backend + web frontend).
+- Whether to keep subprocess orchestration of `tsp` or use TSDuck's Python API.
+- Single-binary distribution (TUI) vs `localhost` service + browser (web UI).
+
+No code committed to either approach yet; architecture will be finalized next.
+
 ## Repository layout
 
 ```
@@ -134,8 +179,9 @@ is created. Functional (playback) verification is deferred to the TSDuck stage.
 - [x] Detect connected devices, record VID:PID and USB speed
 - [x] Confirm the "WinTV-Nova-S2" vs "PCTV 461" identity (confirmed: same unit)
 - [x] DTU-315 driver bring-up on 7.0.0 (Dektec LinuxSDK, `Dtu.ko`, L1 verified)
-- [ ] TBS5530 driver bring-up (cxd28xx)
-- [ ] PCTV 461 / Nova-S2 driver bring-up (em28xx)
+- [x] TBS5530 driver bring-up (cxd28xx + TBS firmware, L1 verified)
+- [ ] PCTV 461 / Nova-S2 driver bring-up (em28xx; blocked on 461e v3 patch)
+- [ ] Decide TUI vs local web UI (open design question)
 - [ ] Build TSDuck in Docker, deploy portable `tsp` to host
 - [ ] Scaffold `tsduck-tui` (Rust + ratatui)
 - [ ] Implement device detection + driver-state diagnostics
