@@ -1,0 +1,16 @@
+# Rust
+/target/
+**/target/
+Cargo.lock.bak
+
+# Docker build outputs
+/docker/out/
+*.deb
+*.tar.gz
+
+# Transport stream samples (large)
+*.ts
+
+# Editor / OS
+.DS_Store
+*.swp
