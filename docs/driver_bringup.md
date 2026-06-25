@@ -218,15 +218,97 @@ curl -fL -o dvb-demod-m88ds3103c.fw \
 sudo install -m644 dvb-demod-m88ds3103c.fw /lib/firmware/   # 16 KB, installed
 ```
 
-### Status: BLOCKED - needs patched em28xx + m88ds3103 (decision required)
+### Resolution: patched custom kernel (option 2)
 
-Stopping here (not attempting an unattended out-of-tree media build overnight).
-Options to discuss/execute next session:
-1. Build only patched `em28xx` + `m88ds3103` modules out-of-tree against this
-   kernel's headers, applying the "461e v3 / m88ds3103c" patches
-   (sources: linux-media patch series; `b-rad-NDi/Ubuntu-media-tree-kernel-builder`;
-   edisionnano's patch).
-2. Rebuild the kernel with the patches applied in-tree.
-3. Use the full `media_build` (tbsdtv or linuxtv) tree with the patches.
+Patched the linux-media "461e v3 / m88ds3103c" series for torvalds v7.0 and
+rebuilt the custom kernel as `7.0.0-20260615-sertac-dcn31fix` (see
+`kernel-deb-package-builder/patches/`). Patches applied:
+- `0002-m88ds3103-Implement-3103c-chip-support.patch` (upstream, clean)
+- `0003-em28xx-Add-Hauppauge-461e-v3.patch` (adapted: board no 108, single-pointer
+  `i2c_client_demod` instead of linux-media's `[0]` array refactor)
 
-Recommended: option 1 (smallest, reversible, fits the host-DKMS approach).
+### Result + Verification (L1 - driver level): PASS (2026-06-15, after reboot)
+
+Kernel: `7.0.0-20260615-sertac-dcn31fix`
+
+```
+$ lsusb -d 2013:0462
+Bus 007 Device 007: ID 2013:0462 PCTV Systems PCTV 461
+
+$ dmesg | grep em28xx
+em28xx 7-2.4:1.0: Identified as PCTV DVB-S2 Stick (461e v3) (card=108)
+ts2020 14-0060: Montage Technology TS2022 successfully identified
+a8293 13-0008: Allegro A8293 SEC successfully attached
+em28xx 7-2.4:1.0: DVB: registering adapter 1 frontend 0 (Montage Technology M88DS3103C)...
+em28xx 7-2.4:1.0: DVB extension successfully initialized
+
+$ ls -la /dev/dvb/adapter1/
+frontend0  demux0  dvr0  net0
+```
+
+Full chain: em28178 bridge + m88ds3103c demod + ts2022 tuner + a8293 SEC.
+
+### L2 (functional) verification: PASS (2026-06-15)
+
+All four reference transponders lock and record on the 461, both with a **direct
+universal LNB** and through a **multiswitch (DiSEqC port A)**. SEC voltage is
+healthy (measured 12.69 V / 17.65 V for 13 V / 18 V commands). See
+`docs/test_log.md` (Test 1c / 1d) for the full diagnosis. Key gotcha: TP #2/#4
+are **DVB-S** (QPSK), not DVB-S2; tuning them as DVB-S2 never locks.
+
+### Quick start: PCTV 461 / WinTV-NOVA-S2 on Debian (cheat sheet)
+
+Minimal steps to make `2013:0462` work on a mainline-based Debian kernel:
+
+1. **Kernel** with `m88ds3103c` + em28xx `461e v3` support. As of 2026-06 this is
+   in torvalds `master` but **not** in the v6.17 / v7.0 tags, so either:
+   - build a kernel newer than the merge, or
+   - apply the two linux-media patches (mirrored in
+     `kernel-deb-package-builder/patches/`):
+     `0002-m88ds3103-Implement-3103c-chip-support.patch` and
+     `0003-em28xx-Add-Hauppauge-461e-v3.patch`.
+2. **Firmware** (always needed, even on mainline - not bundled in the kernel):
+   ```
+   sudo curl -fL -o /lib/firmware/dvb-demod-m88ds3103c.fw \
+     https://hauppauge.s3.us-east-1.amazonaws.com/linux/dvb-demod-m88ds3103c.fw
+   ```
+3. **Plug in + verify**:
+   ```
+   dmesg | grep -E "461e v3|m88ds3103|firmware version"
+   #  ... Identified as PCTV DVB-S2 Stick (461e v3)
+   #  ... m88ds3103: firmware version: 3.8
+   ls /dev/dvb/adapter*/frontend0
+   ```
+4. **Tune** (universal LNB; DiSEqC port via `--satellite-number`). 8PSK ⇒ DVB-S2,
+   plain QPSK ⇒ usually DVB-S:
+   ```
+   dvbv5-zap -a 0 -c chan.conf -l UNIVERSAL -t 10 MYCHANNEL
+   ```
+
+A reader-friendly write-up of this is in `docs/blog_pctv461_debian.md`.
+
+---
+
+## 4. Combined verification on `7.0.0-20260615-sertac-dcn31fix` (USB hub)
+
+Date: 2026-06-15. All three devices connected via Genesys Logic combo hub
+(USB 2.0 leg on Bus 007 + USB 3.0 leg on Bus 008).
+
+| Device    | VID:PID     | USB speed | Driver   | Device node(s)              | L1  |
+| --------- | ----------- | --------- | -------- | --------------------------- | --- |
+| DTU-315   | `1297:030f` | 5000 Mbps | `Dtu`    | `/dev/Dtu4`                 | PASS|
+| TBS5530   | `734c:5530` | 480 Mbps  | `tbs5530`| `/dev/dvb/adapter0` (fe0+1) | PASS|
+| PCTV 461  | `2013:0462` | 480 Mbps  | `em28xx` | `/dev/dvb/adapter1` (fe0)   | PASS|
+
+USB topology notes:
+- DTU-315 is on the hub's **USB 3.0** leg (Bus 008, Genesys `05e3:0626`, 5000M).
+  Correct for modulator playback bandwidth.
+- TBS5530 and PCTV 461 are on the hub's **USB 2.0** leg (Bus 007, Genesys
+  `05e3:0610`, 480M). Both devices are USB 2.0 hardware (`bcdUSB 2.00`); 480 Mbps
+  is their maximum and is sufficient for TS capture (~30-50 Mbps per stream).
+- TBS5530 and PCTV 461 share the same USB 2.0 hub tree (`7-2.1` and `7-2.4`).
+
+Harmless DTU-315 dmesg warnings (missing DekTec config INI files under
+`/etc/DekTec/Dtu/315/`); driver and `/dev/Dtu4` are present regardless.
+
+DKMS modules also rebuilt for this kernel: `dektec_dtu/2026.05.0`, `cxd28xx/0.0.1`.

@@ -72,8 +72,7 @@ usb 5-2.4: 734c:5530 TBS (no strings)
 | --------- | --------------------------------------------- | ------------------------ | ------------- |
 | DTU-315   | Dektec **LinuxSDK** `Dtu.ko` (DKMS)           | uploaded by driver (FX3)              | driver OK (L1)        |
 | TBS5530   | `koreapyj/cxd28xx` (cxd2878 + m88rs6060, DKMS)| `dvb-usb-id5530.fw` + `m88rs6060.fw`  | driver OK (L1)        |
-| PCTV 461  | `em28xx` (em28178 + m88ds3103c) - 461e v3     | `dvb-demod-m88ds3103c.fw` (installed) | blocked (patch needed)|
+| PCTV 461  | `em28xx` (em28178 + m88ds3103c) - 461e v3     | `dvb-demod-m88ds3103c.fw` (installed) | driver OK (L1)        |
 
-DTU-315 and TBS5530 are verified at driver level (L1). PCTV 461 (`2013:0462`) is
-a 461e v3 whose USB id + m88ds3103c demod are not yet in this kernel's `em28xx`;
-it needs the "Hauppauge 461e v3" patches. See driver_bringup.md for full detail.
+All three devices verified at driver level (L1) on kernel
+`7.0.0-20260615-sertac-dcn31fix`. See driver_bringup.md section 4.
