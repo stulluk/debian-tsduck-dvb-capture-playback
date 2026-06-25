@@ -8,9 +8,14 @@ Cargo.lock.bak
 *.deb
 *.tar.gz
 
+# TSDuck build workspace (cloned source + compiled bundle)
+/build/
+*.log
+
 # Transport stream samples (large)
 *.ts
 
 # Editor / OS
 .DS_Store
 *.swp
+captures/
