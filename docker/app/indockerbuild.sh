@@ -45,3 +45,17 @@ cp -f "${BIN}" "${WORKDIR}/dvbhub"
 echo "=== Done. Binary: ${WORKDIR}/dvbhub ==="
 file "${WORKDIR}/dvbhub" || true
 ldd "${WORKDIR}/dvbhub" 2>/dev/null | head -20 || true
+
+# Refresh the system-wide install so we do not keep copying from build/ by hand.
+INSTALL_SCRIPT="${PROJECT_ROOT}/scripts/install-dvbhub-systemwide.sh"
+if [[ -x "${INSTALL_SCRIPT}" ]]; then
+  if [[ "$(id -u)" -eq 0 ]]; then
+    "${INSTALL_SCRIPT}" "${WORKDIR}/dvbhub"
+  elif sudo -n true 2>/dev/null; then
+    echo "=== Installing system-wide via sudo -n ==="
+    sudo -n "${INSTALL_SCRIPT}" "${WORKDIR}/dvbhub"
+  else
+    echo "NOTE: system-wide install skipped (sudo needs a password)."
+    echo "      Run: sudo ${INSTALL_SCRIPT}"
+  fi
+fi

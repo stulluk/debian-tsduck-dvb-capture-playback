@@ -49,6 +49,13 @@ impl TsduckPaths {
             return Ok(Self { dir });
         }
 
+        // Default deploy prefix used by docker/tsduck/deploy.sh (works under sudo
+        // even when secure_path omits /opt/tsduck).
+        let default_dir = PathBuf::from("/opt/tsduck");
+        if is_executable(&default_dir.join("tsp")) {
+            return Ok(Self { dir: default_dir });
+        }
+
         anyhow::bail!("{}", tsp_not_found_message())
     }
 

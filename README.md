@@ -196,31 +196,35 @@ three devices are visible — `tslsdvb` lists the TBS5530 (two frontends) and PC
 
 ## Application (`dvbhub`)
 
-A static `x86_64` musl binary, built in Docker, that runs on the host and drives
-TSDuck via subprocesses. It resolves TSDuck from `$DVBHUB_TSDUCK_DIR`, then
-`/opt/tsduck`, then `$PATH`.
+A `x86_64` glibc binary (GStreamer-linked), built in Docker, that runs on the host
+and drives TSDuck via subprocesses. It resolves TSDuck from `$DVBHUB_TSDUCK_DIR`,
+then `/opt/tsduck`, then `$PATH`.
 
 ```
 cd docker/app
-./dockerbuild.sh                 # build the Rust builder image (rust:alpine, musl)
-./indockerbuild.sh               # compile -> build/dvbhub (static binary)
+./dockerbuild.sh                 # build the Rust builder image (Debian + GStreamer)
+./indockerbuild.sh               # compile -> build/dvbhub, then install system-wide
+                                 # to /usr/local/bin/dvbhub when passwordless sudo works
+
+# refresh system-wide install without rebuilding:
+sudo ./scripts/install-dvbhub-systemwide.sh
 
 # discovery / info:
-build/dvbhub devices             # discover usable DVB devices (+ USB warnings)
-build/dvbhub devices --json      # machine-readable
-build/dvbhub transponders        # the fixed Turksat 42E reference TPs
-build/dvbhub tsduck              # show resolved TSDuck dir + version
-build/dvbhub update-satellites-json   # refresh ~/.config/dvbhub/satellites.json (KingOfSat)
+dvbhub devices                   # discover usable DVB devices (+ USB warnings)
+dvbhub devices --json            # machine-readable
+dvbhub transponders              # the fixed Turksat 42E reference TPs
+dvbhub tsduck                    # show resolved TSDuck dir + version
+dvbhub update-satellites-json    # refresh ~/.config/dvbhub/satellites.json (KingOfSat)
 
 # capture (tuner -> file); use --dry-run to print the tsp command:
-build/dvbhub capture --transponder 1 --device-name /dev/dvb/adapter1 \
+dvbhub capture --transponder 1 --device-name /dev/dvb/adapter0 \
     --seconds 6 --output ref.ts
 
 # interactive capture wizard (DVB-S; manual setup + catalogue satellites):
-build/dvbhub capture --tui
+dvbhub capture --tui
 
 # playout (file -> DTU-315 modulator, L-band IF):
-build/dvbhub playout --input some.ts --frequency-mhz 1200 \
+dvbhub playout --input some.ts --frequency-mhz 1200 \
     --modulation DVB-S2-8PSK --symbol-rate-ksps 30000 --code-rate 3/4 --infinite
 
 # interactive playout wizard:
