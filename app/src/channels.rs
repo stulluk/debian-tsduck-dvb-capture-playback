@@ -44,6 +44,13 @@ pub struct SavedChannel {
     pub modulation: Option<String>,
     pub fec: Option<String>,
     pub satellite_number: Option<u32>,
+    /// Terrestrial bandwidth in MHz (watch/capture).
+    #[serde(default)]
+    pub bandwidth_mhz: Option<u8>,
+    #[serde(default)]
+    pub guard_interval: Option<String>,
+    #[serde(default)]
+    pub plp: Option<u8>,
 }
 
 /// The persisted channel catalogue.
@@ -132,5 +139,117 @@ impl ChannelDb {
         let before = self.channels.len();
         self.channels.retain(|c| &c.delivery != delivery);
         before - self.channels.len()
+    }
+
+    /// All channels sorted by scan order.
+    pub fn sorted_all(&self) -> Vec<&SavedChannel> {
+        let mut list: Vec<_> = self.channels.iter().collect();
+        list.sort_by_key(|c| c.scan_index);
+        list
+    }
+
+    /// Count of channels per delivery type.
+    pub fn count_for(&self, delivery: &ChannelDelivery) -> usize {
+        self.channels.iter().filter(|c| &c.delivery == delivery).count()
+    }
+}
+
+impl SavedChannel {
+    /// Short delivery tag for list rows: SAT / TER / CAB.
+    pub fn delivery_prefix(&self) -> &'static str {
+        match self.delivery {
+            ChannelDelivery::Satellite => "SAT",
+            ChannelDelivery::Terrestrial => "TER",
+            ChannelDelivery::Cable => "CAB",
+        }
+    }
+
+    /// One-line tuning summary shown beside the channel name.
+    pub fn tune_summary(&self) -> String {
+        match self.delivery {
+            ChannelDelivery::Satellite => {
+                let pol = self
+                    .polarity
+                    .as_deref()
+                    .and_then(|p| p.chars().next())
+                    .map(|c| c.to_ascii_uppercase())
+                    .unwrap_or('?');
+                format!(
+                    "{} {} {} {}  sid={}",
+                    self.frequency_mhz.unwrap_or(0),
+                    pol,
+                    self.symbol_rate_ksps.unwrap_or(0),
+                    self.delivery_system.as_deref().unwrap_or("DVB-S"),
+                    self.service_id
+                )
+            }
+            ChannelDelivery::Terrestrial => {
+                let modu = self.modulation.as_deref().unwrap_or("");
+                format!(
+                    "UHF {} MHz {} {}  sid={}",
+                    self.frequency_mhz.unwrap_or(0),
+                    self.delivery_system.as_deref().unwrap_or("DVB-T"),
+                    modu,
+                    self.service_id
+                )
+            }
+            ChannelDelivery::Cable => format!(
+                "{} MHz {} {} kSym  sid={}",
+                self.frequency_mhz.unwrap_or(0),
+                self.delivery_system.as_deref().unwrap_or("DVB-C"),
+                self.symbol_rate_ksps.unwrap_or(0),
+                self.service_id
+            ),
+        }
+    }
+
+    /// Full list row: `[SAT] Kanal D          618 MHz DVB-T2 …`
+    pub fn list_label(&self) -> String {
+        let name = if self.name.len() > 28 {
+            format!("{}…", &self.name[..27])
+        } else {
+            self.name.clone()
+        };
+        format!(
+            "[{}] {:<28} {}",
+            self.delivery_prefix(),
+            name,
+            self.tune_summary()
+        )
+    }
+
+    /// Builds capture tuning parameters for live watch.
+    pub fn to_capture_params(
+        &self,
+        device_name: String,
+        signal_timeout_s: u32,
+    ) -> anyhow::Result<crate::pipeline::CaptureParams> {
+        let delivery_system = self
+            .delivery_system
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("channel '{}' has no delivery_system", self.name))?;
+        let frequency_mhz = self
+            .frequency_mhz
+            .ok_or_else(|| anyhow::anyhow!("channel '{}' has no frequency", self.name))?;
+        Ok(crate::pipeline::CaptureParams {
+            device_name: Some(device_name),
+            adapter: None,
+            delivery_system,
+            frequency_hz: frequency_mhz as u64 * 1_000_000,
+            polarity: self.polarity.clone(),
+            symbol_rate: self.symbol_rate_ksps.map(|s| s as u64 * 1_000),
+            modulation: self.modulation.clone(),
+            fec: self.fec.clone(),
+            lnb: None,
+            satellite_number: self.satellite_number,
+            bandwidth_hz: self.bandwidth_mhz.map(|b| b as u64 * 1_000_000),
+            guard_interval: self.guard_interval.clone(),
+            plp: self.plp,
+            dvb_status_interval_s: None,
+            signal_timeout_s,
+            seconds: 0,
+            output: String::new(),
+            live_analyze: false,
+        })
     }
 }

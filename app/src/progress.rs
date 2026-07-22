@@ -9,8 +9,9 @@ use crate::analyze::{
 };
 use crate::config::TsduckPaths;
 use crate::pipeline::CaptureParams;
-use crate::signal::{parse_signal_line, SignalStatus};
+use crate::signal::{parse_dvbstatus_line, parse_signal_line, SignalStatus};
 use crate::tsduck;
+use crate::lastlog;
 use anyhow::Context;
 use std::io::{BufRead, BufReader};
 use std::process::{Child, Command, Stdio};
@@ -277,6 +278,7 @@ fn run_capture_inner(
         quiet,
         CaptureEvent::Command(tsduck::display_command("tsp", args)),
     );
+    lastlog::event("capture", &tsduck::display_command("tsp", args));
     emit(&events, quiet, CaptureEvent::Status("Starting tsp…".into()));
 
     let mut child = cmd
@@ -300,7 +302,7 @@ fn run_capture_inner(
         let reader = BufReader::new(stderr);
         let mut lock_announced = false;
         for line in reader.lines().map_while(Result::ok) {
-            if let Some(sig) = parse_signal_line(&line) {
+            if let Some(sig) = parse_signal_line(&line).or_else(|| parse_dvbstatus_line(&line)) {
                 if sig.locked {
                     el.store(true, Ordering::SeqCst);
                     if !lock_announced {
@@ -316,12 +318,14 @@ fn run_capture_inner(
                     CaptureEvent::Signal(sig),
                 );
             } else if line.contains("error") || line.contains("Error") {
+                lastlog::event("tsp", line.trim());
                 emit(
                     &ev_stderr,
                     quiet_stderr,
                     CaptureEvent::Log(format!("tsp: {}", line.trim())),
                 );
             } else if line.starts_with('*') || line.contains("dvb:") {
+                lastlog::event("tsp", line.trim());
                 emit(
                     &ev_stderr,
                     quiet_stderr,
@@ -461,6 +465,17 @@ fn run_capture_inner(
     let locked = ever_locked.load(Ordering::SeqCst);
     let last = last_signal.lock().ok().and_then(|g| g.clone());
     let summary = last_summary.lock().ok().and_then(|g| g.clone());
+
+    lastlog::event(
+        "capture",
+        &format!(
+            "done success={} locked={} services={} watchdog={}",
+            status.success() && !killed_by_watchdog,
+            locked,
+            services_found.load(Ordering::SeqCst),
+            killed_by_watchdog
+        ),
+    );
 
     Ok(CaptureRun {
         success: status.success() && !killed_by_watchdog,

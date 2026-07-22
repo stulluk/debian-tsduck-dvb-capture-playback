@@ -1,12 +1,23 @@
-//! Interactive playout wizard for the DTU-315 modulator.
+//! Interactive playout TUI for the DTU-315 modulator.
 
-use crate::analyze::{services_json_path_for_ts, CaptureServicesRecord};
+use crate::analyze::{services_json_path_for_ts, CaptureServicesRecord, TuneRecord};
+use crate::bench;
+use crate::lastlog;
 use crate::config::{AppConfig, TsduckPaths};
 use crate::devices::{DeviceKind, DvbDevice};
-use crate::pipeline::{play_params_from_tune, PlayParams};
+use crate::pipeline::{is_terrestrial_delivery, play_params_from_tune, PlayParams, PlayoutDelivery};
 use crate::tui::confirm::ConfirmPrompt;
 use crate::tui::file_picker::FilePicker;
-use crate::tui::widgets::{list_menu, log_panel, paragraph, picker_layout, KEYS_FOOTER_HEIGHT};
+use crate::tui::manual_playout_cable::{
+    draw_manual_playout_cable, ManualPlayoutCableForm,
+};
+use crate::tui::manual_playout_satellite::{
+    draw_manual_playout_satellite, ManualPlayoutSatelliteForm,
+};
+use crate::tui::manual_playout_terrestrial::{
+    draw_manual_playout_terrestrial, ManualPlayoutTerrestrialForm,
+};
+use crate::tui::widgets::{list_menu, log_panel, paragraph, KEYS_FOOTER_HEIGHT};
 use crate::tsduck;
 use anyhow::Context;
 use crossterm::{
@@ -22,7 +33,7 @@ use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::time::Duration;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DeliveryChoice {
     Satellite,
     Terrestrial,
@@ -33,13 +44,9 @@ impl DeliveryChoice {
     fn label(self) -> &'static str {
         match self {
             Self::Satellite => "Satellite (DVB-S / DVB-S2)",
-            Self::Terrestrial => "Terrestrial (DVB-T / T2) — coming soon",
-            Self::Cable => "Cable (DVB-C) — coming soon",
+            Self::Terrestrial => "Terrestrial (DVB-T / DVB-T2)",
+            Self::Cable => "Cable (DVB-C)",
         }
-    }
-
-    fn supported(self) -> bool {
-        matches!(self, Self::Satellite)
     }
 
     fn from_index(i: usize) -> Self {
@@ -51,201 +58,25 @@ impl DeliveryChoice {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum ManualStep {
-    Delivery,
-    Frequency,
-    Modulation,
-    SymbolRate,
-    Fec,
-    Loop,
-    Review,
-}
-
-struct ManualForm {
-    delivery_sel: usize,
-    if_frequency_mhz: u32,
-    modulation: String,
-    modulation_sel: usize,
-    symbol_rate_ksps: u32,
-    code_rate: String,
-    fec_sel: usize,
-    infinite: bool,
-    step: ManualStep,
-}
-
-impl ManualForm {
-    fn new() -> Self {
-        Self {
-            delivery_sel: 0,
-            if_frequency_mhz: 1200,
-            modulation: MODULATIONS[0].into(),
-            modulation_sel: 0,
-            symbol_rate_ksps: SYMBOL_RATES[0],
-            code_rate: FECS[0].into(),
-            fec_sel: 0,
-            infinite: true,
-            step: ManualStep::Delivery,
-        }
-    }
-
-    fn to_play_params(&self, input: String) -> PlayParams {
-        PlayParams {
-            input,
-            infinite: self.infinite,
-            frequency_hz: self.if_frequency_mhz as u64 * 1_000_000,
-            modulation: self.modulation.clone(),
-            symbol_rate: self.symbol_rate_ksps as u64 * 1_000,
-            code_rate: self.code_rate.clone(),
-            level_dbm_tenths: None,
-            instant_detach: !self.infinite,
-        }
-    }
-
-    fn step_title(&self) -> &'static str {
-        match self.step {
-            ManualStep::Delivery => "Playout — delivery system",
-            ManualStep::Frequency => "Playout — IF frequency (MHz)",
-            ManualStep::Modulation => "Playout — modulation",
-            ManualStep::SymbolRate => "Playout — symbol rate (kSym/s)",
-            ManualStep::Fec => "Playout — FEC",
-            ManualStep::Loop => "Playout — loop file",
-            ManualStep::Review => "Playout — confirm & start",
-        }
-    }
-
-    fn rows(&self) -> Vec<String> {
-        match self.step {
-            ManualStep::Delivery => vec![
-                DeliveryChoice::Satellite.label().into(),
-                DeliveryChoice::Terrestrial.label().into(),
-                DeliveryChoice::Cable.label().into(),
-            ],
-            ManualStep::Frequency => vec![format!("IF frequency: {} MHz", self.if_frequency_mhz)],
-            ManualStep::Modulation => MODULATIONS.iter().map(|m| (*m).into()).collect(),
-            ManualStep::SymbolRate => SYMBOL_RATES
-                .iter()
-                .map(|sr| format!("{sr} kSym/s"))
-                .collect(),
-            ManualStep::Fec => FECS.iter().map(|f| (*f).into()).collect(),
-            ManualStep::Loop => vec![format!(
-                "Loop forever: {}",
-                if self.infinite { "yes" } else { "no" }
-            )],
-            ManualStep::Review => vec![
-                format!("Delivery: {}", DeliveryChoice::from_index(self.delivery_sel).label()),
-                format!("IF: {} MHz", self.if_frequency_mhz),
-                format!("Modulation: {}", self.modulation),
-                format!("Symbol rate: {} kSym/s", self.symbol_rate_ksps),
-                format!("FEC: {}", self.code_rate),
-                format!("Loop: {}", if self.infinite { "yes" } else { "no" }),
-                "▶ Start playout".into(),
-            ],
-        }
-    }
-
-    fn selection_index(&self) -> usize {
-        match self.step {
-            ManualStep::Delivery => self.delivery_sel,
-            ManualStep::Modulation => self.modulation_sel,
-            ManualStep::SymbolRate => SYMBOL_RATES
-                .iter()
-                .position(|&s| s == self.symbol_rate_ksps)
-                .unwrap_or(0),
-            ManualStep::Fec => self.fec_sel,
-            ManualStep::Review => 6,
-            _ => 0,
-        }
-    }
-
-    fn apply_list_nav(&mut self, key: KeyCode) -> bool {
-        let rows = self.rows();
-        let mut sel = self.selection_index();
-        let max = rows.len().saturating_sub(1);
-        match key {
-            KeyCode::Up if sel > 0 => sel -= 1,
-            KeyCode::Down if sel < max => sel += 1,
-            _ => return false,
-        }
-        match self.step {
-            ManualStep::Delivery => self.delivery_sel = sel,
-            ManualStep::Modulation => {
-                self.modulation_sel = sel;
-                self.modulation = MODULATIONS[sel].into();
-            }
-            ManualStep::SymbolRate => self.symbol_rate_ksps = SYMBOL_RATES[sel],
-            ManualStep::Fec => {
-                self.fec_sel = sel;
-                self.code_rate = FECS[sel].into();
-            }
-            _ => return false,
-        }
-        true
-    }
-
-    fn apply_edit(&mut self, key: KeyCode) -> bool {
-        match self.step {
-            ManualStep::Frequency => match key {
-                KeyCode::Left => self.if_frequency_mhz = self.if_frequency_mhz.saturating_sub(1),
-                KeyCode::Right => self.if_frequency_mhz = (self.if_frequency_mhz + 1).min(2150),
-                KeyCode::Char('-') | KeyCode::Char('_') => {
-                    self.if_frequency_mhz = self.if_frequency_mhz.saturating_sub(10)
-                }
-                KeyCode::Char('+') | KeyCode::Char('=') => {
-                    self.if_frequency_mhz = (self.if_frequency_mhz + 10).min(2150)
-                }
-                _ => return false,
-            },
-            ManualStep::Loop => match key {
-                KeyCode::Enter | KeyCode::Char(' ') => self.infinite = !self.infinite,
-                _ => return false,
-            },
-            _ => return false,
-        }
-        true
-    }
-
-    fn advance(&mut self) -> Result<(), &'static str> {
-        if self.step == ManualStep::Delivery {
-            let choice = DeliveryChoice::from_index(self.delivery_sel);
-            if !choice.supported() {
-                return Err("only DVB-S/S2 playout is implemented");
-            }
-        }
-        self.step = match self.step {
-            ManualStep::Delivery => ManualStep::Frequency,
-            ManualStep::Frequency => ManualStep::Modulation,
-            ManualStep::Modulation => ManualStep::SymbolRate,
-            ManualStep::SymbolRate => ManualStep::Fec,
-            ManualStep::Fec => ManualStep::Loop,
-            ManualStep::Loop => ManualStep::Review,
-            ManualStep::Review => ManualStep::Review,
-        };
-        Ok(())
-    }
-
-    fn retreat(&mut self) {
-        self.step = match self.step {
-            ManualStep::Delivery => ManualStep::Delivery,
-            ManualStep::Frequency => ManualStep::Delivery,
-            ManualStep::Modulation => ManualStep::Frequency,
-            ManualStep::SymbolRate => ManualStep::Modulation,
-            ManualStep::Fec => ManualStep::SymbolRate,
-            ManualStep::Loop => ManualStep::Fec,
-            ManualStep::Review => ManualStep::Loop,
-        };
+fn delivery_from_tune(tune: &TuneRecord) -> DeliveryChoice {
+    let sys = tune.delivery_system.to_ascii_uppercase();
+    if sys.starts_with("DVB-C") {
+        DeliveryChoice::Cable
+    } else if is_terrestrial_delivery(&sys) {
+        DeliveryChoice::Terrestrial
+    } else {
+        DeliveryChoice::Satellite
     }
 }
-
-const MODULATIONS: &[&str] = &["DVB-S2-8PSK", "DVB-S2-QPSK", "DVB-S-QPSK"];
-const SYMBOL_RATES: &[u32] = &[30000, 27500, 22000, 20000];
-const FECS: &[&str] = &["3/4", "5/6", "2/3"];
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Screen {
     FilePick,
     FromServices,
-    Manual,
+    ManualDelivery,
+    ManualSatellite,
+    ManualTerrestrial,
+    ManualCable,
     Run,
 }
 
@@ -280,6 +111,7 @@ pub fn run_playout_tui(
     input: Option<String>,
     auto: bool,
 ) -> anyhow::Result<()> {
+    lastlog::event("tui.playout", &format!("start auto={auto} input={input:?}"));
     let discovery = crate::devices::discover(&paths)?;
     let modulator: Option<DvbDevice> = discovery
         .devices
@@ -293,17 +125,23 @@ pub fn run_playout_tui(
     if auto {
         let ts = input.context("--input FILE.ts is required for --tui-auto")?;
         let path = PathBuf::from(&ts);
-        let params = load_playout_from_ts(&path, true)?
-            .unwrap_or_else(|| ManualForm::new().to_play_params(ts));
+        let params = load_playout_from_ts(&path, true)?.unwrap_or_else(|| {
+            ManualPlayoutCableForm::new_default().to_play_params(ts)
+        });
         return run_playout_tui_auto(paths, params, modulator.as_ref());
     }
 
+    let cfg = AppConfig::load();
+    let _ = bench::ensure_bench_sidecars(&cfg.capture_dir);
+
     let mut screen = Screen::FilePick;
-    let mut picker = FilePicker::open(Some(AppConfig::load().capture_dir));
+    let mut picker = FilePicker::open(Some(bench::playout_picker_root(&cfg.capture_dir)));
     let mut selected_ts: Option<PathBuf> = input.map(PathBuf::from);
     let mut services: Option<CaptureServicesRecord> = None;
-    let mut manual = ManualForm::new();
-    let mut list_sel = 0usize;
+    let mut manual_sat = ManualPlayoutSatelliteForm::new_default();
+    let mut manual_terr = ManualPlayoutTerrestrialForm::new_default();
+    let mut manual_cable = ManualPlayoutCableForm::new_default();
+    let mut delivery_sel = 0usize;
     let mut status = String::new();
     let mut pending_playout: Option<PlayParams> = None;
     let mut run_state = PlayoutRunState {
@@ -321,14 +159,7 @@ pub fn run_playout_tui(
     let mut confirm = ConfirmPrompt::default();
 
     if let Some(ref ts) = selected_ts {
-        prepare_after_file_pick(
-            ts,
-            &mut screen,
-            &mut services,
-            &mut manual,
-            &mut manual_return,
-            &mut status,
-        )?;
+        prepare_after_file_pick(ts, &mut screen, &mut services, &mut status)?;
     }
 
     let mut stdout = stdout();
@@ -355,16 +186,34 @@ pub fn run_playout_tui(
                     services.as_ref(),
                     &status,
                 ),
-                Screen::Manual => {
-                    draw_manual(
-                        f,
-                        modulator.as_ref(),
-                        selected_ts.as_ref(),
-                        &manual,
-                        list_sel,
-                        &status,
-                    )
-                }
+                Screen::ManualDelivery => draw_manual_delivery(
+                    f,
+                    delivery_sel,
+                    selected_ts.as_ref(),
+                    modulator.as_ref(),
+                    &status,
+                ),
+                Screen::ManualSatellite => draw_manual_playout_satellite(
+                    f,
+                    &manual_sat,
+                    selected_ts.as_ref(),
+                    modulator.as_ref(),
+                    &status,
+                ),
+                Screen::ManualTerrestrial => draw_manual_playout_terrestrial(
+                    f,
+                    &manual_terr,
+                    selected_ts.as_ref(),
+                    modulator.as_ref(),
+                    &status,
+                ),
+                Screen::ManualCable => draw_manual_playout_cable(
+                    f,
+                    &manual_cable,
+                    selected_ts.as_ref(),
+                    modulator.as_ref(),
+                    &status,
+                ),
                 Screen::Run => draw_run(f, modulator.as_ref(), &run_state),
             }
             confirm.draw(f);
@@ -415,13 +264,22 @@ pub fn run_playout_tui(
                             screen = run_return_screen;
                         }
                         Screen::FromServices => screen = Screen::FilePick,
-                        Screen::Manual if manual.step == ManualStep::Delivery => {
+                        Screen::ManualDelivery => {
                             screen = manual_return;
                             status.clear();
                         }
-                        Screen::Manual => {
-                            manual.retreat();
-                            list_sel = 0;
+                        Screen::ManualSatellite | Screen::ManualTerrestrial | Screen::ManualCable => {
+                            if manual_sat.editing_active()
+                                || manual_terr.editing_active()
+                                || manual_cable.editing_active()
+                            {
+                                manual_sat.cancel_edit();
+                                manual_terr.cancel_edit();
+                                manual_cable.cancel_edit();
+                            } else {
+                                screen = Screen::ManualDelivery;
+                                status.clear();
+                            }
                         }
                         Screen::FilePick => {
                             let _ = picker.on_key(key);
@@ -442,53 +300,99 @@ pub fn run_playout_tui(
                                 &ts,
                                 &mut screen,
                                 &mut services,
-                                &mut manual,
-                                &mut manual_return,
                                 &mut status,
                             )?;
-                            list_sel = 0;
+                            delivery_sel = 0;
                         }
                     }
                     Screen::FromServices => match key.code {
                         KeyCode::Enter => {
                             let ts = selected_ts.as_ref().context("missing ts")?;
                             run_return_screen = Screen::FromServices;
-                            pending_playout = load_playout_from_ts(ts, true)?;
+                            match load_playout_from_ts(ts, true) {
+                                Ok(Some(p)) => {
+                                    status.clear();
+                                    pending_playout = Some(p);
+                                }
+                                Ok(None) => {
+                                    status =
+                                        "sidecar tune could not be mapped — use m for manual"
+                                            .into();
+                                }
+                                Err(e) => status = format!("Error: {e:#}"),
+                            }
                         }
                         KeyCode::Char('m') => {
                             manual_return = Screen::FromServices;
-                            manual = ManualForm::new();
-                            screen = Screen::Manual;
-                            status = "manual parameters".into();
-                            list_sel = 0;
+                            let tune = services.as_ref().map(|s| &s.tune);
+                            open_manual_forms_from_tune(
+                                tune,
+                                &mut manual_sat,
+                                &mut manual_terr,
+                                &mut manual_cable,
+                                &mut delivery_sel,
+                                &mut screen,
+                            );
+                            status.clear();
                         }
                         _ => {}
                     },
-                    Screen::Manual => {
-                        list_sel = manual.selection_index();
-                        if manual.apply_list_nav(key.code) || manual.apply_edit(key.code) {
-                            continue;
+                    Screen::ManualDelivery => match key.code {
+                        KeyCode::Up if delivery_sel > 0 => delivery_sel -= 1,
+                        KeyCode::Down if delivery_sel < 2 => delivery_sel += 1,
+                        KeyCode::Enter => {
+                            screen = match DeliveryChoice::from_index(delivery_sel) {
+                                DeliveryChoice::Satellite => Screen::ManualSatellite,
+                                DeliveryChoice::Terrestrial => Screen::ManualTerrestrial,
+                                DeliveryChoice::Cable => Screen::ManualCable,
+                            };
+                            status.clear();
                         }
-                        match key.code {
-                            KeyCode::Left => {
-                                manual.retreat();
-                                list_sel = 0;
-                            }
-                            KeyCode::Enter => {
-                                if manual.step == ManualStep::Review && manual.selection_index() == 6
-                                {
+                        _ => {}
+                    },
+                    Screen::ManualSatellite => {
+                        if let Some(result) = manual_sat.on_key(key.code) {
+                            match result {
+                                Ok(()) => {
                                     let ts = selected_ts.as_ref().context("missing ts")?;
-                                    run_return_screen = Screen::Manual;
-                                    pending_playout =
-                                        Some(manual.to_play_params(ts.display().to_string()));
-                                } else if let Err(msg) = manual.advance() {
-                                    status = msg.into();
-                                } else {
-                                    list_sel = 0;
+                                    run_return_screen = Screen::ManualSatellite;
+                                    pending_playout = Some(
+                                        manual_sat.to_play_params(ts.display().to_string()),
+                                    );
                                     status.clear();
                                 }
+                                Err(msg) => status = msg.into(),
                             }
-                            _ => {}
+                        }
+                    }
+                    Screen::ManualTerrestrial => {
+                        if let Some(result) = manual_terr.on_key(key.code) {
+                            match result {
+                                Ok(()) => {
+                                    let ts = selected_ts.as_ref().context("missing ts")?;
+                                    run_return_screen = Screen::ManualTerrestrial;
+                                    pending_playout = Some(
+                                        manual_terr.to_play_params(ts.display().to_string()),
+                                    );
+                                    status.clear();
+                                }
+                                Err(msg) => status = msg.into(),
+                            }
+                        }
+                    }
+                    Screen::ManualCable => {
+                        if let Some(result) = manual_cable.on_key(key.code) {
+                            match result {
+                                Ok(()) => {
+                                    let ts = selected_ts.as_ref().context("missing ts")?;
+                                    run_return_screen = Screen::ManualCable;
+                                    pending_playout = Some(
+                                        manual_cable.to_play_params(ts.display().to_string()),
+                                    );
+                                    status.clear();
+                                }
+                                Err(msg) => status = msg.into(),
+                            }
                         }
                     }
                     Screen::Run => {}
@@ -596,14 +500,29 @@ fn begin_playout(
     if modulator.is_none() {
         anyhow::bail!("no modulator found — connect DTU-315");
     }
-    let if_mhz = params.frequency_hz / 1_000_000;
+    let mhz = params.frequency_hz / 1_000_000;
+    let freq = match params.delivery {
+        PlayoutDelivery::Satellite => format!("IF {mhz} MHz"),
+        PlayoutDelivery::Terrestrial | PlayoutDelivery::Cable => format!("RF {mhz} MHz"),
+    };
+    let mut tail = params.modulation.clone();
+    if let Some(sr) = params.symbol_rate {
+        tail.push_str(&format!(" · {} kSym/s", sr / 1_000));
+    }
+    if let Some(bw) = params.bandwidth_hz {
+        tail.push_str(&format!(" · BW {} MHz", bw / 1_000_000));
+    }
+    if let Some(cr) = &params.code_rate {
+        tail.push_str(&format!(" · FEC {cr}"));
+    }
+    if let Some(j) = &params.j83 {
+        tail.push_str(&format!(" · J.83 {j}"));
+    }
     run_state.summary = format!(
-        "{} → {} MHz {} · {} kSym/s FEC {}{}",
+        "{} → {} {}{}",
         crate::tui::widgets::truncate_end(&params.input, 72),
-        if_mhz,
-        params.modulation,
-        params.symbol_rate / 1_000,
-        params.code_rate,
+        freq,
+        tail,
         if params.infinite { " · loop" } else { "" }
     );
     if let Some(m) = modulator {
@@ -717,26 +636,96 @@ fn draw_run(frame: &mut Frame, modulator: Option<&DvbDevice>, st: &PlayoutRunSta
     paragraph(frame, chunks[2], "Keys", keys);
 }
 
+fn open_manual_forms_from_tune(
+    tune: Option<&TuneRecord>,
+    manual_sat: &mut ManualPlayoutSatelliteForm,
+    manual_terr: &mut ManualPlayoutTerrestrialForm,
+    manual_cable: &mut ManualPlayoutCableForm,
+    delivery_sel: &mut usize,
+    screen: &mut Screen,
+) {
+    if let Some(tune) = tune {
+        let delivery = delivery_from_tune(tune);
+        *delivery_sel = match delivery {
+            DeliveryChoice::Satellite => 0,
+            DeliveryChoice::Terrestrial => 1,
+            DeliveryChoice::Cable => 2,
+        };
+        match delivery {
+            DeliveryChoice::Satellite => {
+                *manual_sat = ManualPlayoutSatelliteForm::from_tune(tune);
+                *screen = Screen::ManualSatellite;
+            }
+            DeliveryChoice::Terrestrial => {
+                *manual_terr = ManualPlayoutTerrestrialForm::from_tune(tune);
+                *screen = Screen::ManualTerrestrial;
+            }
+            DeliveryChoice::Cable => {
+                *manual_cable = ManualPlayoutCableForm::from_tune(tune);
+                *screen = Screen::ManualCable;
+            }
+        }
+    } else {
+        *screen = Screen::ManualDelivery;
+    }
+}
+
+fn draw_manual_delivery(
+    frame: &mut Frame,
+    selected: usize,
+    ts: Option<&PathBuf>,
+    modulator: Option<&DvbDevice>,
+    status: &str,
+) {
+    let rows = [
+        DeliveryChoice::Satellite.label(),
+        DeliveryChoice::Terrestrial.label(),
+        DeliveryChoice::Cable.label(),
+    ];
+    let area = frame.area();
+    let footer_h = KEYS_FOOTER_HEIGHT + 2;
+    let list_h = area.height.saturating_sub(footer_h);
+    list_menu(
+        frame,
+        Rect::new(area.x, area.y, area.width, list_h),
+        "Playout — delivery system",
+        &rows.iter().map(|s| (*s).into()).collect::<Vec<_>>(),
+        selected,
+    );
+    let file_line = ts
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
+    let mod_line = modulator
+        .map(|m| format!("{} @ {}", m.model, m.address))
+        .unwrap_or_else(|| "NOT FOUND".into());
+    let body = if status.is_empty() {
+        format!("File: {file_line}\nModulator: {mod_line}\n\n↑↓ · Enter open form · Esc back")
+    } else {
+        format!("{status}\n\nFile: {file_line}\nModulator: {mod_line}\n\n↑↓ · Enter · Esc back")
+    };
+    paragraph(
+        frame,
+        Rect::new(area.x, area.y + list_h, area.width, footer_h),
+        "Keys",
+        &body,
+    );
+}
+
 fn prepare_after_file_pick(
     ts: &PathBuf,
     screen: &mut Screen,
     services: &mut Option<CaptureServicesRecord>,
-    manual: &mut ManualForm,
-    manual_return: &mut Screen,
     status: &mut String,
 ) -> anyhow::Result<()> {
     let sidecar = services_json_path_for_ts(ts);
     if sidecar.is_file() {
         *services = Some(CaptureServicesRecord::read_file(&sidecar)?);
         *screen = Screen::FromServices;
-        *manual_return = Screen::FilePick;
         status.clear();
     } else {
         *services = None;
-        *manual = ManualForm::new();
-        *screen = Screen::Manual;
-        *manual_return = Screen::FilePick;
-        *status = "no sidecar *_services.json — enter parameters manually".into();
+        *screen = Screen::ManualDelivery;
+        *status = "no sidecar — pick delivery, then edit all parameters on one form".into();
     }
     Ok(())
 }
@@ -773,6 +762,7 @@ fn run_no_modulator_screen() -> anyhow::Result<()> {
     disable_raw_mode()?;
     term.backend_mut().execute(LeaveAlternateScreen)?;
     term.show_cursor()?;
+    lastlog::event("tui.playout", "end");
     Ok(())
 }
 
@@ -802,20 +792,49 @@ fn draw_from_services(
     let body = match (ts, services) {
         (Some(ts), Some(rec)) => {
             let t = &rec.tune;
-            let if_mhz = crate::pipeline::l_band_if_mhz_universal(t.frequency_mhz);
+            let sys = t.delivery_system.to_ascii_uppercase();
+            let tune_line = if sys.starts_with("DVB-T") {
+                format!(
+                    "RF: {} MHz {} {} FEC {}\nPlayout: {} MHz DVB-T/T2 · Services: {}",
+                    t.frequency_mhz,
+                    t.delivery_system,
+                    t.modulation,
+                    t.fec,
+                    t.frequency_mhz,
+                    rec.services.len(),
+                )
+            } else if sys.starts_with("DVB-C") {
+                format!(
+                    "RF: {} MHz {} SR {} kS/s {} FEC {}\nPlayout: {} MHz {} · Services: {}",
+                    t.frequency_mhz,
+                    t.delivery_system,
+                    t.symbol_rate_ksps,
+                    t.modulation,
+                    t.fec,
+                    t.frequency_mhz,
+                    t.modulation,
+                    rec.services.len(),
+                )
+            } else {
+                let if_mhz = crate::pipeline::l_band_if_mhz_universal(t.frequency_mhz);
+                format!(
+                    "Downlink: {} MHz {} · SR {} · {} {} FEC {}\n\
+                     Playout IF: {} MHz · Services: {}",
+                    t.frequency_mhz,
+                    t.polarity,
+                    t.symbol_rate_ksps,
+                    t.delivery_system,
+                    t.modulation,
+                    t.fec,
+                    if_mhz,
+                    rec.services.len(),
+                )
+            };
             format!(
-                "File: {}\nSidecar: {}\nDownlink: {} MHz {} · SR {} · {} {} FEC {}\n\
-                 Playout IF: {} MHz · Services: {}\n{}",
+                "File: {}\nSidecar: {}\n{}\n{}",
                 ts.display(),
                 services_json_path_for_ts(ts).display(),
-                t.frequency_mhz,
-                t.polarity,
-                t.symbol_rate_ksps,
-                t.delivery_system,
-                t.modulation,
-                t.fec,
-                if_mhz,
-                rec.services.len(),
+                tune_line,
                 status
             )
         }
@@ -842,46 +861,55 @@ fn draw_from_services(
     );
 }
 
-fn draw_manual(
-    frame: &mut Frame,
-    modulator: Option<&DvbDevice>,
-    ts: Option<&PathBuf>,
-    form: &ManualForm,
-    selected: usize,
-    status: &str,
-) {
-    let [list_area, info_area, keys_area] = picker_layout(frame.area());
-    let rows = form.rows();
-    let sel = selected.min(rows.len().saturating_sub(1));
-    list_menu(frame, list_area, form.step_title(), &rows, sel);
-    let info = match (ts, modulator) {
-        (Some(p), Some(m)) => format!("{} · {} @ {}", p.display(), m.model, m.address),
-        (Some(p), None) => format!("{} · modulator NOT FOUND", p.display()),
-        _ => String::new(),
-    };
-    let info_body = if status.is_empty() {
-        info.clone()
-    } else {
-        status.to_string()
-    };
-    paragraph(frame, info_area, "File", &info_body);
-    let keys_hint = if info.is_empty() {
-        "↑↓ · Enter next/start · ← step back · Esc back · q quit".to_string()
-    } else {
-        format!(
-            "↑↓ · Enter · ← back · q · {}",
-            crate::tui::widgets::truncate_end(&info, keys_area.width.saturating_sub(4) as usize)
-        )
-    };
-    paragraph(frame, keys_area, "Keys", &keys_hint);
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::analyze::TuneRecord;
-    use crate::pipeline::{dektec_modulation_from_tune, l_band_if_mhz_universal};
+    use crate::pipeline::{dektec_modulation_from_tune, l_band_if_mhz_universal, PlayoutDelivery};
+    use crate::tui::manual_playout_cable::ManualPlayoutCableForm;
     use ratatui::backend::TestBackend;
+
+    #[test]
+    fn cable_and_terrestrial_dektec_tokens() {
+        let cable = TuneRecord {
+            frequency_mhz: 722,
+            polarity: String::new(),
+            symbol_rate_ksps: 6876,
+            delivery_system: "DVB-C".into(),
+            modulation: "256-QAM".into(),
+            fec: "auto".into(),
+        };
+        assert_eq!(
+            dektec_modulation_from_tune(&cable).as_deref(),
+            Some("256-QAM")
+        );
+        let terr = TuneRecord {
+            frequency_mhz: 618,
+            polarity: String::new(),
+            symbol_rate_ksps: 0,
+            delivery_system: "DVB-T2".into(),
+            modulation: "64-QAM".into(),
+            fec: "2/3".into(),
+        };
+        assert_eq!(
+            dektec_modulation_from_tune(&terr).as_deref(),
+            Some("DVB-T2")
+        );
+    }
+
+    #[test]
+    fn manual_cable_form_defaults() {
+        let form = ManualPlayoutCableForm::new_default();
+        let params = form.to_play_params("/tmp/x.ts".into());
+        assert_eq!(params.frequency_hz, 722_000_000);
+        assert_eq!(params.delivery, PlayoutDelivery::Cable);
+        assert_eq!(params.j83.as_deref(), Some("A"));
+        let args = params.to_tsp_args().join(" ");
+        assert!(args.contains("-m 256-QAM"));
+        assert!(args.contains("--symbol-rate 6876000"));
+        assert!(args.contains("--j83 A"));
+        assert!(!args.contains("-r "));
+    }
 
     #[test]
     fn tune_to_dektec_token() {
@@ -901,12 +929,13 @@ mod tests {
     }
 
     #[test]
-    fn manual_form_renders() {
+    fn manual_delivery_renders() {
         let backend = TestBackend::new(80, 20);
         let mut term = Terminal::new(backend).unwrap();
-        let form = ManualForm::new();
-        term.draw(|f| list_menu(f, f.area(), form.step_title(), &form.rows(), 0))
-            .unwrap();
-        assert!(format!("{:?}", term.backend().buffer()).contains("delivery"));
+        term.draw(|f| {
+            draw_manual_delivery(f, 2, None, None, "");
+        })
+        .unwrap();
+        assert!(format!("{:?}", term.backend().buffer()).contains("Cable"));
     }
 }

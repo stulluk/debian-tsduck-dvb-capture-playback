@@ -9,6 +9,7 @@
 use crate::analyze;
 use crate::channels::{ChannelDb, ChannelDelivery, SavedChannel};
 use crate::config::{AppConfig, TsduckPaths};
+use crate::lastlog;
 use crate::devices::Discovery;
 use crate::monitor::{self, DeviceState};
 use crate::refdb::{ReferenceCapture, ReferenceCaptureDb, ReferenceTpDb};
@@ -56,6 +57,7 @@ const HLS_JS: &str = include_str!("../web/hls.min.js");
 /// Runs the web server until the process is interrupted. Blocking entry point
 /// for the CLI (`dvbhub serve`); builds its own Tokio runtime.
 pub fn serve_blocking(bind: &str, port: u16) -> anyhow::Result<()> {
+    lastlog::event("cmd.serve", &format!("bind={bind} port={port}"));
     let paths = TsduckPaths::resolve()?;
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -623,6 +625,9 @@ async fn api_channels_save(
             modulation: req.tune.modulation.clone(),
             fec: req.tune.fec.clone(),
             satellite_number: req.tune.satellite_number,
+            bandwidth_mhz: None,
+            guard_interval: None,
+            plp: None,
         });
         base_index += 1;
     }

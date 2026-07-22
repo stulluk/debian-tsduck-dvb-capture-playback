@@ -23,6 +23,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::{broadcast, Mutex, RwLock};
 
+use crate::signal::parse_dvbstatus_line;
 use crate::signal::parse_signal_line;
 pub use crate::signal::SignalStatus;
 
@@ -331,6 +332,10 @@ impl SessionManager {
             fec: req.fec.clone(),
             lnb: None,
             satellite_number: req.satellite_number,
+            bandwidth_hz: None,
+            guard_interval: None,
+            plp: None,
+            dvb_status_interval_s: None,
             signal_timeout_s: req.signal_timeout_s.unwrap_or(15),
             seconds,
             output,
@@ -700,6 +705,10 @@ impl SessionManager {
                 fec: Some(tp.fec.clone()),
                 lnb: plan.lnb.clone(),
                 satellite_number: Some(plan.diseqc),
+                bandwidth_hz: None,
+                guard_interval: None,
+                plp: None,
+                dvb_status_interval_s: None,
                 signal_timeout_s: plan.signal_timeout_s,
                 seconds: plan.seconds,
                 output: file.to_string_lossy().into_owned(),
@@ -813,10 +822,15 @@ impl SessionManager {
         let params = PlayParams {
             input: file.clone(),
             infinite: req.infinite,
+            delivery: crate::pipeline::PlayoutDelivery::Satellite,
             frequency_hz: req.frequency_mhz as u64 * 1_000_000,
             modulation: req.modulation.clone(),
-            symbol_rate: req.symbol_rate_ksps as u64 * 1_000,
-            code_rate: req.code_rate.clone(),
+            symbol_rate: Some(req.symbol_rate_ksps as u64 * 1_000),
+            code_rate: Some(req.code_rate.clone()),
+            bandwidth_hz: None,
+            guard_interval: None,
+            plp_modulation: None,
+            j83: None,
             level_dbm_tenths: req.level,
             instant_detach: !req.infinite,
         };
@@ -1189,7 +1203,7 @@ async fn stream_logs(
             continue;
         }
         if is_stderr {
-            if let Some(sig) = parse_signal_line(&line) {
+            if let Some(sig) = parse_signal_line(&line).or_else(|| parse_dvbstatus_line(&line)) {
                 mgr.push_signal(sig).await;
             }
             if line.contains("error") || line.contains("Error") {
@@ -1276,7 +1290,7 @@ async fn read_tune_output(
             line = stderr_lines.next_line() => {
                 match line {
                     Ok(Some(line)) => {
-                        if let Some(sig) = parse_signal_line(&line) {
+                        if let Some(sig) = parse_signal_line(&line).or_else(|| parse_dvbstatus_line(&line)) {
                             mgr.push_signal(sig).await;
                         }
                         if line.contains("error") || line.contains("Error") {

@@ -7,6 +7,7 @@
 //! physically connected but not yet usable (missing driver/firmware).
 
 use crate::config::TsduckPaths;
+use crate::lastlog;
 use crate::tsduck;
 use crate::usb;
 use serde::Serialize;
@@ -39,6 +40,13 @@ impl DeliveryCategory {
             DeliveryCategory::Cable => "cable",
         }
     }
+}
+
+/// One selectable delivery path in the capture TUI (filtered per tuner).
+#[derive(Debug, Clone, Copy)]
+pub struct DeliveryChoice {
+    pub category: DeliveryCategory,
+    pub label: &'static str,
 }
 
 /// Classifies a single delivery-system string into a broad category.
@@ -98,6 +106,66 @@ impl DvbDevice {
         }
         self.categories = cats;
     }
+
+    /// True when this frontend advertises the given delivery category.
+    pub fn supports_category(&self, cat: DeliveryCategory) -> bool {
+        self.categories.iter().any(|c| c == cat.as_str())
+    }
+
+    /// Comma-separated delivery systems for UI labels (`DVB-S, DVB-S2`).
+    pub fn delivery_systems_label(&self) -> String {
+        if self.delivery_systems.is_empty() {
+            "(no delivery systems)".into()
+        } else {
+            self.delivery_systems.join(", ")
+        }
+    }
+
+    /// Capture TUI device row: `PCTV 461 — /dev/dvb/adapter0 [DVB-S, DVB-S2]`.
+    pub fn tuner_menu_label(&self) -> String {
+        format!(
+            "{} — {} [{}]",
+            self.label,
+            self.address,
+            self.delivery_systems_label()
+        )
+    }
+
+    /// Linux DVB device path for capture on the given delivery category.
+    pub fn capture_address(&self, category: DeliveryCategory) -> String {
+        match category {
+            DeliveryCategory::Terrestrial | DeliveryCategory::Cable
+                if self.backend == "linux-dvb" && !self.address.contains(':') =>
+            {
+                frontend0_device_name(&self.address)
+            }
+            _ => self.address.clone(),
+        }
+    }
+}
+
+/// Delivery capture modes offered for one tuner (derived from ENUM_DELSYS / tslsdvb).
+pub fn delivery_choices(device: &DvbDevice) -> Vec<DeliveryChoice> {
+    let mut out = Vec::new();
+    if device.supports_category(DeliveryCategory::Satellite) {
+        out.push(DeliveryChoice {
+            category: DeliveryCategory::Satellite,
+            label: "Satellite (DVB-S / S2)",
+        });
+    }
+    if device.supports_category(DeliveryCategory::Terrestrial) {
+        out.push(DeliveryChoice {
+            category: DeliveryCategory::Terrestrial,
+            label: "Terrestrial (DVB-T / T2)",
+        });
+    }
+    if device.supports_category(DeliveryCategory::Cable) {
+        out.push(DeliveryChoice {
+            category: DeliveryCategory::Cable,
+            label: "Cable (DVB-C)",
+        });
+    }
+    out
 }
 
 /// Result of a discovery pass.
@@ -127,10 +195,74 @@ pub fn discover(paths: &TsduckPaths) -> anyhow::Result<Discovery> {
     for dev in &mut devices {
         dev.refresh_categories();
     }
+    lastlog::event(
+        "devices",
+        &format!(
+            "discover ok tuners={} modulators={} warnings={}",
+            devices.iter().filter(|d| d.kind == DeviceKind::Tuner).count(),
+            devices.iter().filter(|d| d.kind == DeviceKind::Modulator).count(),
+            warnings.len()
+        ),
+    );
+    for w in &warnings {
+        lastlog::event("devices.warn", w);
+    }
+    for d in &devices {
+        lastlog::event(
+            "devices",
+            &format!(
+                "{} kind={:?} addr={} cats=[{}]",
+                d.label,
+                d.kind,
+                d.address,
+                d.categories.join(",")
+            ),
+        );
+    }
     Ok(Discovery { devices, warnings })
 }
 
 impl Discovery {
+    /// Returns capture tuners that advertise at least one delivery category.
+    pub fn capture_tuners(&self) -> Vec<&DvbDevice> {
+        self.devices
+            .iter()
+            .filter(|d| d.kind == DeviceKind::Tuner && !d.categories.is_empty())
+            .collect()
+    }
+
+    /// True when at least one usable capture tuner was discovered.
+    pub fn has_capture_tuners(&self) -> bool {
+        !self.capture_tuners().is_empty()
+    }
+
+    /// Picks a tuner for the given delivery category (bench-aware preferences).
+    pub fn tuner_for_category(&self, cat: DeliveryCategory) -> Option<&DvbDevice> {
+        let supports = |d: &&DvbDevice| {
+            d.kind == DeviceKind::Tuner && d.supports_category(cat)
+        };
+        match cat {
+            DeliveryCategory::Satellite => self
+                .devices
+                .iter()
+                .filter(supports)
+                .find(|d| d.label.contains("PCTV") || d.label.contains("461"))
+                .or_else(|| self.devices.iter().find(supports)),
+            DeliveryCategory::Terrestrial => self
+                .devices
+                .iter()
+                .filter(supports)
+                .find(|d| d.label.contains("TBS5530") || d.model.to_lowercase().contains("tbs 5530"))
+                .or_else(|| self.devices.iter().find(supports)),
+            DeliveryCategory::Cable => self
+                .devices
+                .iter()
+                .filter(supports)
+                .find(|d| d.label.contains("TBS5530") || d.model.to_lowercase().contains("tbs 5530"))
+                .or_else(|| self.devices.iter().find(supports)),
+        }
+    }
+
     /// Returns the address of a satellite (DVB-S/S2) tuner suitable for a
     /// loopback re-capture. Prefers the TBS5530 S/S2 frontend (the device wired
     /// to the DTU-315 output on this bench); otherwise falls back to any tuner
@@ -156,6 +288,39 @@ impl Discovery {
             .iter()
             .find(supports_sat)
             .map(|d| d.address.clone())
+    }
+
+    /// Returns the Linux DVB device name for terrestrial capture on the TBS5530
+    /// frontend 0 (`adapterN:0`). Falls back to any terrestrial-capable tuner.
+    pub fn terrestrial_tuner_address(&self) -> Option<String> {
+        let supports_terr = |d: &&DvbDevice| {
+            d.kind == DeviceKind::Tuner
+                && d
+                    .categories
+                    .iter()
+                    .any(|c| c == DeliveryCategory::Terrestrial.as_str())
+        };
+        if let Some(d) = self
+            .devices
+            .iter()
+            .filter(supports_terr)
+            .find(|d| d.label.contains("TBS5530") || d.model.to_lowercase().contains("tbs 5530"))
+        {
+            return Some(frontend0_device_name(&d.address));
+        }
+        self.devices
+            .iter()
+            .find(supports_terr)
+            .map(|d| frontend0_device_name(&d.address))
+    }
+}
+
+/// Selects DVB-T/T2 frontend 0 on a multi-frontend adapter.
+fn frontend0_device_name(address: &str) -> String {
+    if address.contains(':') {
+        address.to_string()
+    } else {
+        format!("{address}:0")
     }
 }
 
@@ -296,5 +461,77 @@ fn matches_known(dev: &DvbDevice, known_label: &str) -> bool {
         "TBS5530" => model.contains("tbs 5530") || model.contains("tbs5530"),
         "PCTV 461" => model.contains("m88ds3103") || model.contains("pctv"),
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_sat() -> DvbDevice {
+        DvbDevice {
+            label: "PCTV 461".into(),
+            model: "Montage Technology M88DS3103C".into(),
+            kind: DeviceKind::Tuner,
+            backend: "linux-dvb".into(),
+            address: "/dev/dvb/adapter0".into(),
+            delivery_systems: vec!["DVB-S".into(), "DVB-S2".into()],
+            categories: vec!["satellite".into()],
+            usb_present: true,
+            vid_pid: None,
+        }
+    }
+
+    fn sample_terr() -> DvbDevice {
+        DvbDevice {
+            label: "TBS5530".into(),
+            model: "TurboSight TBS 5530 DVB-T/T2".into(),
+            kind: DeviceKind::Tuner,
+            backend: "linux-dvb".into(),
+            address: "/dev/dvb/adapter1".into(),
+            delivery_systems: vec![
+                "DVB-T".into(),
+                "DVB-T2".into(),
+                "DVB-C".into(),
+                "ATSC".into(),
+            ],
+            categories: vec!["terrestrial".into(), "cable".into()],
+            usb_present: true,
+            vid_pid: None,
+        }
+    }
+
+    #[test]
+    fn delivery_choices_sat_only() {
+        let choices = delivery_choices(&sample_sat());
+        assert_eq!(choices.len(), 1);
+        assert_eq!(choices[0].category, DeliveryCategory::Satellite);
+    }
+
+    #[test]
+    fn delivery_choices_terr_and_cable() {
+        let choices = delivery_choices(&sample_terr());
+        assert_eq!(choices.len(), 2);
+        assert_eq!(choices[0].category, DeliveryCategory::Terrestrial);
+        assert_eq!(choices[1].category, DeliveryCategory::Cable);
+    }
+
+    #[test]
+    fn tuner_menu_label_includes_delsys() {
+        let label = sample_sat().tuner_menu_label();
+        assert!(label.contains("PCTV 461"));
+        assert!(label.contains("DVB-S2"));
+    }
+
+    #[test]
+    fn terr_capture_address_adds_frontend0() {
+        assert_eq!(
+            sample_terr().capture_address(DeliveryCategory::Terrestrial),
+            "/dev/dvb/adapter1:0"
+        );
+        assert_eq!(
+            sample_sat().capture_address(DeliveryCategory::Satellite),
+            "/dev/dvb/adapter0"
+        );
     }
 }

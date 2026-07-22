@@ -1,55 +1,55 @@
 //! Runtime configuration: locating the deployed TSDuck installation.
-//!
-//! TSDuck is built in Docker and deployed to an isolated, self-contained prefix
-//! on the host (default `/opt/tsduck`, see `docker/tsduck/deploy.sh`). The binary
-//! resolves the tool directory at runtime so the same binary works regardless of
-//! where TSDuck was deployed.
 
+use crate::lastlog;
+use crate::tools::{find_executable_on_path, is_executable};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-/// Environment variable that overrides the TSDuck installation directory.
+/// Environment variable that overrides the TSDuck tool directory.
 pub const ENV_TSDUCK_DIR: &str = "DVBHUB_TSDUCK_DIR";
-
-/// Default isolated prefix where the TSDuck bundle is deployed on the host.
-pub const DEFAULT_TSDUCK_DIR: &str = "/opt/tsduck";
 
 /// Resolved locations of the TSDuck tools used by the orchestrator.
 #[derive(Debug, Clone)]
 pub struct TsduckPaths {
-    /// Directory containing the TSDuck tools (tsp, tsdektec, tslsdvb, ...).
+    /// Directory containing `tsp` and sibling TSDuck tools.
     pub dir: PathBuf,
 }
 
 impl TsduckPaths {
-    /// Resolves the TSDuck directory from `$DVBHUB_TSDUCK_DIR`, then the default
-    /// prefix, then any `tsp` found on `$PATH`. Returns an error if none works.
+    /// Resolves TSDuck from `$PATH` (`tsp` must be executable).
+    ///
+    /// Optional override: `$DVBHUB_TSDUCK_DIR` must contain an executable `tsp`.
     pub fn resolve() -> anyhow::Result<Self> {
+        let result = Self::resolve_inner();
+        match &result {
+            Ok(p) => lastlog::event("config", &format!("tsduck dir={}", p.dir.display())),
+            Err(e) => lastlog::event("config", &format!("tsduck resolve failed: {e:#}")),
+        }
+        result
+    }
+
+    fn resolve_inner() -> anyhow::Result<Self> {
         if let Some(dir) = std::env::var_os(ENV_TSDUCK_DIR) {
             let dir = PathBuf::from(dir);
-            if dir.join("tsp").is_file() {
+            let tsp = dir.join("tsp");
+            if is_executable(&tsp) {
                 return Ok(Self { dir });
             }
             anyhow::bail!(
-                "{ENV_TSDUCK_DIR} is set to {} but no tsp binary was found there",
+                "{ENV_TSDUCK_DIR} is set to {} but no executable `tsp` was found there",
                 dir.display()
             );
         }
 
-        let default = Path::new(DEFAULT_TSDUCK_DIR);
-        if default.join("tsp").is_file() {
-            return Ok(Self {
-                dir: default.to_path_buf(),
-            });
-        }
-
-        if let Some(dir) = find_on_path("tsp") {
+        if let Some(tsp) = find_executable_on_path("tsp") {
+            let dir = tsp
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| PathBuf::from("."));
             return Ok(Self { dir });
         }
 
-        anyhow::bail!(
-            "TSDuck not found. Deploy it (docker/tsduck/deploy.sh) or set {ENV_TSDUCK_DIR}."
-        )
+        anyhow::bail!("{}", tsp_not_found_message())
     }
 
     /// Absolute path to a TSDuck tool by name (e.g. "tsp", "tsdektec").
@@ -58,20 +58,27 @@ impl TsduckPaths {
     }
 }
 
-/// Searches `$PATH` for an executable and returns the directory containing it.
-fn find_on_path(exe: &str) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&path) {
-        if dir.join(exe).is_file() {
-            return Some(dir);
-        }
-    }
-    None
+fn tsp_not_found_message() -> String {
+    format!(
+        "TSDuck `tsp` not found on $PATH.\n\
+         \n\
+         dvbhub requires a TSDuck build with Linux DVB and (for DTU-315 playout) Dektec support.\n\
+         \n\
+         Build and install from this repository:\n\
+           ./docker/tsduck/dockerbuild.sh\n\
+           ./docker/tsduck/indockerbuild.sh\n\
+           ./docker/tsduck/deploy.sh          # installs under /opt/tsduck — add to PATH\n\
+         \n\
+         See docs/tsduck_build.md for DTAPI / LinuxSDK details (Dektec DTU-315 needs DTAPI).\n\
+         \n\
+         After install, ensure `tsp` is on your PATH, or set:\n\
+           export {ENV_TSDUCK_DIR}=/path/to/tsduck-bundle\n\
+         \n\
+         Related project: https://gitlab.com/stulluk/tsduck-capture-playback"
+    )
 }
 
 /// The user's home directory, resolved in an OS-agnostic way.
-///
-/// Uses `%USERPROFILE%` on Windows and `$HOME` elsewhere.
 pub fn home_dir() -> Option<PathBuf> {
     #[cfg(windows)]
     {
@@ -83,9 +90,7 @@ pub fn home_dir() -> Option<PathBuf> {
     }
 }
 
-/// The per-user configuration directory, following platform conventions:
-/// `%APPDATA%` (Windows), `~/Library/Application Support` (macOS),
-/// `$XDG_CONFIG_HOME` or `~/.config` (Linux/other).
+/// The per-user configuration directory, following platform conventions.
 pub fn config_dir() -> Option<PathBuf> {
     #[cfg(windows)]
     {
@@ -127,30 +132,25 @@ pub fn log_file_path() -> PathBuf {
         .join("dvbhub.log")
 }
 
-/// The per-user dvbhub data directory (`<config_dir>/dvbhub`), where all
-/// persisted JSON databases live. Created on demand by the callers.
+/// The per-user dvbhub data directory (`<config_dir>/dvbhub`).
 pub fn data_dir() -> PathBuf {
     config_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join("dvbhub")
 }
 
-/// Path to the persisted satellite database (`<data_dir>/satellites.json`).
 pub fn satellites_file_path() -> PathBuf {
     data_dir().join("satellites.json")
 }
 
-/// Path to the user's reference transponders (`<data_dir>/reference_transponders.json`).
 pub fn reference_transponders_file_path() -> PathBuf {
     data_dir().join("reference_transponders.json")
 }
 
-/// Path to the reference playout captures (`<data_dir>/reference_captures.json`).
 pub fn reference_captures_file_path() -> PathBuf {
     data_dir().join("reference_captures.json")
 }
 
-/// Path to the saved TV channel catalogue (`<data_dir>/channels.json`).
 pub fn channels_file_path() -> PathBuf {
     data_dir().join("channels.json")
 }
@@ -158,9 +158,7 @@ pub fn channels_file_path() -> PathBuf {
 /// User-editable application settings, persisted to `config.json`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
-    /// Directory where captures and HLS segments are written.
     pub capture_dir: PathBuf,
-    /// Default capture duration per transponder (TUI / satellite capture).
     #[serde(default = "default_capture_seconds")]
     pub capture_seconds: u32,
 }
@@ -179,7 +177,6 @@ impl Default for AppConfig {
 }
 
 impl AppConfig {
-    /// Loads the config from disk, falling back to defaults if missing/invalid.
     pub fn load() -> Self {
         let path = config_file_path();
         if let Ok(text) = std::fs::read_to_string(&path) {
@@ -190,7 +187,6 @@ impl AppConfig {
         AppConfig::default()
     }
 
-    /// Persists the config to disk, creating parent directories as needed.
     pub fn save(&self) -> std::io::Result<()> {
         let path = config_file_path();
         if let Some(parent) = path.parent() {
@@ -201,9 +197,6 @@ impl AppConfig {
         std::fs::write(&path, text)
     }
 
-    /// Resolves a capture output name to an absolute path. Absolute inputs are
-    /// used as-is; relative names are placed inside `capture_dir` (any leading
-    /// directory components in the name are preserved).
     pub fn resolve_output(&self, name: &str) -> PathBuf {
         let p = Path::new(name);
         if p.is_absolute() {
@@ -213,12 +206,10 @@ impl AppConfig {
         }
     }
 
-    /// Directory for live HLS playback segments.
     pub fn hls_dir(&self) -> PathBuf {
         self.capture_dir.join("hls")
     }
 
-    /// Expands a leading `~` in a path string to the user's home directory.
     pub fn expand_path(path: &str) -> PathBuf {
         let trimmed = path.trim();
         if let Some(rest) = trimmed.strip_prefix("~/") {
@@ -230,5 +221,17 @@ impl AppConfig {
             return home_dir().unwrap_or_else(|| PathBuf::from("."));
         }
         PathBuf::from(trimmed)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tsp_not_found_message_mentions_build_docs() {
+        let msg = tsp_not_found_message();
+        assert!(msg.contains("docs/tsduck_build.md"));
+        assert!(msg.contains("tsp"));
     }
 }

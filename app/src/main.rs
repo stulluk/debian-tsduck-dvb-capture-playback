@@ -6,7 +6,11 @@
 //! tools as subprocesses.
 
 mod analyze;
+mod bench;
+mod cable;
+mod cable_capture;
 mod channels;
+mod channels_import;
 mod config;
 mod devices;
 mod monitor;
@@ -17,15 +21,26 @@ mod satellites;
 mod sat_capture;
 mod scan;
 mod signal;
+mod terr_capture;
+mod terrestrial;
+mod tools;
 mod transponders;
+mod ts_pcr;
 mod tsduck;
 mod tui;
 mod usb;
 mod session;
+mod lastlog;
+mod watch;
+mod watch_gst;
+mod watch_pipe;
+mod watch_pipeline;
+mod watch_test;
 mod web;
 
 use anyhow::Context;
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
+use clap_complete::{generate, Shell};
 use config::TsduckPaths;
 use pipeline::{CaptureParams, PlayParams};
 use std::thread::sleep;
@@ -73,6 +88,12 @@ enum Commands {
     Watch(WatchArgs),
     /// Start the local web interface (browser UI on localhost).
     Serve(ServeArgs),
+    /// Print shell completion scripts (bash: `dvbhub completions bash > /etc/bash_completion.d/dvbhub`).
+    Completions {
+        /// Target shell.
+        #[arg(value_enum)]
+        shell: Shell,
+    },
 }
 
 /// Arguments for the `serve` subcommand.
@@ -209,7 +230,7 @@ struct WatchArgs {
     adapter: Option<u32>,
     /// Service id (program number) to play.
     #[arg(long)]
-    service: u64,
+    service: Option<u64>,
     /// Delivery system (e.g. DVB-S2), required without --transponder.
     #[arg(long)]
     delivery_system: Option<String>,
@@ -235,17 +256,35 @@ struct WatchArgs {
     #[arg(long)]
     satellite_number: Option<u32>,
     /// Signal-lock timeout in seconds.
-    #[arg(long, default_value_t = 15)]
+    #[arg(long, default_value_t = watch::WATCH_SIGNAL_TIMEOUT_S)]
     signal_timeout: u32,
     /// Media player command that reads MPEG-TS from stdin.
-    #[arg(long, default_value = "mpv --force-window=yes --title=dvbhub -")]
+    #[arg(long, default_value = "mpv --force-window=yes --title=dvbhub --cache=yes --demuxer-readahead-secs=0 --msg-level=cplayer=v,ffmpeg=v -")]
     player: String,
     /// Transcode audio to AAC (needed for HLS/browser; mpv plays MP2 as-is).
     #[arg(long)]
     transcode_audio: bool,
+    /// Video only: do not open an audio sink (avoids broken PipeWire blocking playback).
+    #[arg(long)]
+    no_audio: bool,
     /// Print the assembled tsp command without running it.
     #[arg(long)]
     dry_run: bool,
+    /// Interactive channel list and live playback (ratatui).
+    #[arg(long)]
+    tui: bool,
+    /// Channel name from ~/.config/dvbhub/channels.json (non-TUI playback).
+    #[arg(long)]
+    channel: Option<String>,
+    /// Headless automated test: null vo/ao, stop after --duration seconds.
+    #[arg(long)]
+    test: bool,
+    /// Compare PCR vs video PTS vs wall clock for --duration seconds (implies --test).
+    #[arg(long)]
+    sync_test: bool,
+    /// Playback duration for --test mode (seconds).
+    #[arg(long, default_value_t = 30)]
+    duration: u32,
 }
 
 /// Arguments for the `analyze` subcommand.
@@ -343,7 +382,19 @@ struct LoopbackArgs {
 
 /// Program entry point.
 fn main() -> anyhow::Result<()> {
+    lastlog::init();
+    let result = main_inner();
+    match &result {
+        Ok(()) => lastlog::event("main", "exit ok"),
+        Err(e) => lastlog::event("main", &format!("exit error: {e:#}")),
+    }
+    result
+}
+
+fn main_inner() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    let sub = std::env::args().nth(1).unwrap_or_default();
+    lastlog::event("main", &format!("subcommand={sub}"));
     match cli.command {
         Commands::Devices { json } => cmd_devices(json),
         Commands::Transponders { json } => cmd_transponders(json),
@@ -356,11 +407,13 @@ fn main() -> anyhow::Result<()> {
         Commands::Analyze(args) => cmd_analyze(args),
         Commands::Watch(args) => cmd_watch(args),
         Commands::Serve(args) => web::serve_blocking(&args.bind, args.port),
+        Commands::Completions { shell } => cmd_completions(shell),
     }
 }
 
 /// Implements the `devices` subcommand.
 fn cmd_devices(json: bool) -> anyhow::Result<()> {
+    lastlog::event("cmd.devices", &format!("json={json}"));
     let paths = TsduckPaths::resolve()?;
     let discovery = devices::discover(&paths)?;
 
@@ -483,6 +536,10 @@ fn capture_params_from_args(args: &CaptureArgs) -> anyhow::Result<CaptureParams>
         fec: args.fec.clone(),
         lnb: args.lnb.clone(),
         satellite_number: args.satellite_number,
+        bandwidth_hz: None,
+        guard_interval: None,
+        plp: None,
+        dvb_status_interval_s: None,
         signal_timeout_s: args.signal_timeout,
         seconds: args.seconds,
         output: args.output.clone().unwrap_or_default(),
@@ -492,6 +549,10 @@ fn capture_params_from_args(args: &CaptureArgs) -> anyhow::Result<CaptureParams>
 
 /// Implements the `capture` subcommand.
 fn cmd_capture(args: CaptureArgs) -> anyhow::Result<()> {
+    lastlog::event(
+        "cmd.capture",
+        &format!("tui={} tui_auto={} seconds={}", args.tui, args.tui_auto, args.seconds),
+    );
     let paths = TsduckPaths::resolve()?;
 
     if args.tui || args.tui_auto {
@@ -863,6 +924,10 @@ fn watch_params(args: &WatchArgs) -> anyhow::Result<CaptureParams> {
         fec: args.fec.clone(),
         lnb: args.lnb.clone(),
         satellite_number: args.satellite_number,
+        bandwidth_hz: None,
+        guard_interval: None,
+        plp: None,
+        dvb_status_interval_s: None,
         signal_timeout_s: args.signal_timeout,
         seconds: 0,
         output: String::new(),
@@ -872,52 +937,105 @@ fn watch_params(args: &WatchArgs) -> anyhow::Result<CaptureParams> {
 
 /// Implements the `watch` subcommand: live FTA playback to a media player.
 ///
-/// Assembles `tsp -I dvb <tune> -P zap <sid> -O fork "ffmpeg … | <player>"`.
-/// The ffmpeg stage remuxes the single service to MPEG-TS (video copied; audio
-/// optionally transcoded to AAC) and pipes it to the player on stdin.
+/// GStreamer watch: `tsp -I dvb … -P zap <sid> -O file → appsrc ! tsdemux ! …`.
 fn cmd_watch(args: WatchArgs) -> anyhow::Result<()> {
+    lastlog::event(
+        "cmd.watch",
+        &format!(
+            "tui={} test={} channel={:?} service={:?}",
+            args.tui, args.test, args.channel, args.service
+        ),
+    );
     let paths = TsduckPaths::resolve()?;
-    let params = watch_params(&args)?;
+    if args.tui {
+        return tui::run_watch_tui(paths);
+    }
 
-    // Start from the capture argv, then drop the file output stage.
+    if args.sync_test || args.test || args.channel.is_some() {
+        let name = args
+            .channel
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("--channel NAME is required with --test/--sync-test"))?;
+        let duration = if args.sync_test && args.duration == 30 {
+            10
+        } else {
+            args.duration
+        };
+        let report = watch_test::run_channel_test(
+            &paths,
+            name,
+            duration,
+            args.transcode_audio,
+            args.sync_test || args.test,
+        )?;
+        if (args.test || args.sync_test) && !report.passed() {
+            anyhow::bail!(
+                "watch test failed — see {} (max_time={:.2}s video_bufs={})",
+                lastlog::path().display(),
+                report.max_time_pos,
+                report.max_est_frames
+            );
+        }
+        return Ok(());
+    }
+
+    let service = args
+        .service
+        .ok_or_else(|| anyhow::anyhow!("--service SID, --channel, or --tui is required"))?;
+
+    if args.dry_run {
+        let params = watch_params(&args)?;
+        let mut tsp_args = params.to_tsp_args();
+        if let Some(i) = tsp_args.iter().position(|a| a == "-O") {
+            tsp_args.truncate(i);
+        }
+        tsp_args.extend([
+            "-P".into(),
+            "zap".into(),
+            service.to_string(),
+        ]);
+        println!(
+            "{} -O file | {}",
+            tsduck::display_command("tsp", &tsp_args),
+            watch::build_fork_cmd(&args.player, args.transcode_audio)
+        );
+        return Ok(());
+    }
+
+    let params = watch_params(&args)?;
     let mut tsp_args = params.to_tsp_args();
     if let Some(i) = tsp_args.iter().position(|a| a == "-O") {
         tsp_args.truncate(i);
     }
-
-    let audio_codec = if args.transcode_audio {
-        "-c:a aac -b:a 128k -ac 2"
-    } else {
-        "-c:a copy"
-    };
-    let ffmpeg = format!(
-        "ffmpeg -hide_banner -loglevel fatal -fflags +genpts+discardcorrupt \
-         -i pipe:0 -map 0:v:0 -map 0:a:0? -c:v copy {audio_codec} -f mpegts pipe:1"
-    );
-    let fork_cmd = format!("{ffmpeg} | {}", args.player);
-
     tsp_args.extend([
         "-P".into(),
         "zap".into(),
-        args.service.to_string(),
-        "-O".into(),
-        "fork".into(),
-        fork_cmd,
+        service.to_string(),
     ]);
 
-    if args.dry_run {
-        println!("{}", tsduck::display_command("tsp", &tsp_args));
-        return Ok(());
+    let end = watch::run_tsp_watch(
+        &paths,
+        tsp_args,
+        watch::WatchOpts {
+            transcode_audio: args.transcode_audio,
+            audio: if args.no_audio {
+                watch_gst::WatchAudioMode::None
+            } else {
+                watch_gst::WatchAudioMode::from_env()
+            },
+            ..Default::default()
+        },
+    )?;
+    if !end.success() {
+        anyhow::bail!("watch failed — see {}", lastlog::path().display());
     }
+    Ok(())
+}
 
-    println!(
-        "watching service {} (Ctrl-C to stop) via: {}",
-        args.service, args.player
-    );
-    let ok = tsduck::run_inherit(&paths, "tsp", &tsp_args)?;
-    if !ok {
-        anyhow::bail!("watch pipeline exited with an error (see output above)");
-    }
+/// Writes shell completion scripts to stdout.
+fn cmd_completions(shell: Shell) -> anyhow::Result<()> {
+    let mut cmd = Cli::command();
+    generate(shell, &mut cmd, "dvbhub", &mut std::io::stdout());
     Ok(())
 }
 
@@ -978,6 +1096,10 @@ fn cmd_update_satellites_json(args: UpdateSatellitesJsonArgs) -> anyhow::Result<
 
 /// Implements the `playout` subcommand.
 fn cmd_playout(args: PlayoutArgs) -> anyhow::Result<()> {
+    lastlog::event(
+        "cmd.playout",
+        &format!("tui={} input={:?}", args.tui, args.input),
+    );
     let paths = TsduckPaths::resolve()?;
 
     if args.tui || args.tui_auto {
@@ -1005,10 +1127,15 @@ fn cmd_playout(args: PlayoutArgs) -> anyhow::Result<()> {
     let params = PlayParams {
         input,
         infinite: args.infinite,
+        delivery: pipeline::PlayoutDelivery::Satellite,
         frequency_hz: args.frequency_mhz as u64 * 1_000_000,
         modulation: args.modulation.clone(),
-        symbol_rate: args.symbol_rate_ksps as u64 * 1_000,
-        code_rate: args.code_rate.clone(),
+        symbol_rate: Some(args.symbol_rate_ksps as u64 * 1_000),
+        code_rate: Some(args.code_rate.clone()),
+        bandwidth_hz: None,
+        guard_interval: None,
+        plp_modulation: None,
+        j83: None,
         level_dbm_tenths: args.level,
         // A finite, fire-and-forget playout detaches to avoid an end-of-stream
         // hang; an infinite playout stays attached so it keeps transmitting.
@@ -1063,10 +1190,15 @@ fn cmd_loopback(args: LoopbackArgs) -> anyhow::Result<()> {
     let play = PlayParams {
         input: args.input.clone(),
         infinite: true,
+        delivery: pipeline::PlayoutDelivery::Satellite,
         frequency_hz,
         modulation: args.modulation.clone(),
-        symbol_rate: args.symbol_rate_ksps as u64 * 1_000,
-        code_rate: args.code_rate.clone(),
+        symbol_rate: Some(args.symbol_rate_ksps as u64 * 1_000),
+        code_rate: Some(args.code_rate.clone()),
+        bandwidth_hz: None,
+        guard_interval: None,
+        plp_modulation: None,
+        j83: None,
         level_dbm_tenths: None,
         // Stay attached for the whole capture: a detached playout would stop
         // transmitting once the on-board FIFO drains, breaking the lock.
@@ -1084,6 +1216,10 @@ fn cmd_loopback(args: LoopbackArgs) -> anyhow::Result<()> {
         // Direct L-band injection: bypass LNB local-oscillator subtraction.
         lnb: Some("0".to_string()),
         satellite_number: None,
+        bandwidth_hz: None,
+        guard_interval: None,
+        plp: None,
+        dvb_status_interval_s: None,
         signal_timeout_s: 12,
         seconds: args.seconds,
         output: args.output.clone(),
