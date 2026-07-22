@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 #
-# Compile the dvbhub Rust binary inside the builder container and copy the
-# resulting static binary to <project>/build/dvbhub.
+# Compile dvbhub (GStreamer-linked glibc binary) inside the builder container.
 #
 # Usage: ./indockerbuild.sh
 #
@@ -13,7 +12,6 @@ IMAGE_NAME="dvbhub-builder-docker:latest"
 
 APP_DIR="${PROJECT_ROOT}/app"
 WORKDIR="${PROJECT_ROOT}/build"
-TARGET="x86_64-unknown-linux-musl"
 
 if ! docker image inspect "${IMAGE_NAME}" >/dev/null 2>&1; then
     echo "ERROR: image ${IMAGE_NAME} not found. Run ./dockerbuild.sh first." >&2
@@ -25,7 +23,7 @@ mkdir -p "${WORKDIR}/cargo-home"
 TTY_FLAGS=""
 [ -t 0 ] && TTY_FLAGS="-it"
 
-echo "=== Compiling dvbhub (target ${TARGET}) ==="
+echo "=== Compiling dvbhub (glibc + GStreamer) ==="
 docker run --rm ${TTY_FLAGS} \
     --user "$(id -u)":"$(id -g)" \
     --volume="/etc/passwd:/etc/passwd:ro" \
@@ -35,14 +33,15 @@ docker run --rm ${TTY_FLAGS} \
     --env CARGO_HOME="${WORKDIR}/cargo-home" \
     --env CARGO_TARGET_DIR="${WORKDIR}/target" \
     "${IMAGE_NAME}" \
-    cargo build --release --target "${TARGET}"
+    cargo build --release
 
-BIN="${WORKDIR}/target/${TARGET}/release/dvbhub"
+BIN="${WORKDIR}/target/release/dvbhub"
 if [[ ! -x "${BIN}" ]]; then
     echo "ERROR: built binary not found at ${BIN}" >&2
     exit 1
 fi
 
 cp -f "${BIN}" "${WORKDIR}/dvbhub"
-echo "=== Done. Static binary: ${WORKDIR}/dvbhub ==="
+echo "=== Done. Binary: ${WORKDIR}/dvbhub ==="
 file "${WORKDIR}/dvbhub" || true
+ldd "${WORKDIR}/dvbhub" 2>/dev/null | head -20 || true

@@ -1,11 +1,15 @@
-# Build environment for the dvbhub Rust application.
-# Produces a fully static x86_64 musl binary that runs on the host with no
-# runtime library dependencies (it drives TSDuck purely via subprocesses).
-FROM rust:alpine
+# Build environment for dvbhub with embedded GStreamer (dynamic link against Debian libs).
+# Produces a glibc binary; host needs matching GStreamer plugin packages at runtime.
+FROM rust:1-bookworm
 
-# musl-dev provides the C runtime bits some crates need at build time; gcc is
-# required to compile C/asm in the rustls TLS stack (ring) for the musl target.
-RUN apk add --no-cache musl-dev gcc
-
-# Ensure the musl target is available (default on rust:alpine, explicit here).
-RUN rustup target add x86_64-unknown-linux-musl
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    pkg-config \
+    libssl-dev \
+    libgstreamer1.0-dev \
+    libgstreamer-plugins-base1.0-dev \
+    gstreamer1.0-plugins-base \
+    gstreamer1.0-plugins-good \
+    gstreamer1.0-plugins-bad \
+    gstreamer1.0-libav \
+    gstreamer1.0-tools \
+    && rm -rf /var/lib/apt/lists/*
