@@ -15,6 +15,9 @@ Cargo.lock.bak
 # Transport stream samples (large)
 *.ts
 
+# Ad-hoc device debug dumps
+xiaomitv-logcat.txt
+
 # Editor / OS
 .DS_Store
 *.swp

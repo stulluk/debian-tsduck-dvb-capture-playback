@@ -287,6 +287,21 @@ Minimal steps to make `2013:0462` work on a mainline-based Debian kernel:
 
 A reader-friendly write-up of this is in `docs/blog_pctv461_debian.md`.
 
+### Alternative: DKMS overlay without rebuilding the kernel
+
+If the host must stay on a **stock Ubuntu/Debian kernel** (no custom `.deb`),
+install the same two patches as an out-of-tree DKMS package that replaces
+`em28xx` / `em28xx-dvb` / `m88ds3103`:
+
+```bash
+sudo ./scripts/install-pctv461-dkms.sh
+```
+
+This is how PCTV was enabled on **gediz-lenovo** (Ubuntu 26.04, `7.0.0-*-generic`)
+and **lenovo-wifi / T14** (Ubuntu 22.04 HWE `6.8.0-*-generic`). Full host notes,
+verification, and the combined TBS/Dektec scripts are in
+[`ubuntu_stock_kernel_install.md`](ubuntu_stock_kernel_install.md).
+
 ---
 
 ## 4. Combined verification on `7.0.0-20260615-sertac-dcn31fix` (USB hub)

@@ -31,10 +31,13 @@ for the full inventory and detection evidence):
 | --------------- | ----------- | ------------------- | ---------------------------------- | ---------------------- |
 | DTU-315         | `1297:030f` | Playback (modulate) | Dektec **LinuxSDK** `Dtu` (DKMS)   | driver OK (L1)         |
 | TBS5530         | `734c:5530` | Capture + Playback  | `koreapyj/cxd28xx` (DKMS) + TBS fw | driver OK (L1)         |
-| "WinTV-Nova-S2" | `2013:0462` | Capture             | `em28xx` (461e v3 patch in kernel) | driver OK (L1)         |
+| "WinTV-Nova-S2" | `2013:0462` | Capture             | `em28xx` (461e v3: patched kernel **or** DKMS) | driver OK (L1)     |
 
 All three verified at driver level on kernel `7.0.0-20260615-sertac-dcn31fix`
-(2026-06-15). DVB-S capture verified on TBS5530; PCTV 461 lock depends on cabling.
+(2026-06-15). The same PCTV stick also works on **stock Ubuntu** kernels via a
+DKMS overlay (no custom kernel): Ubuntu 22.04 HWE 6.8 (T14) and Ubuntu 26.04 7.0
+(gediz-lenovo) — see [`docs/ubuntu_stock_kernel_install.md`](docs/ubuntu_stock_kernel_install.md).
+DVB-S capture verified on TBS5530 and PCTV 461 (Turksat 11054).
 
 All three are currently connected at **USB 2.0 High Speed (480 Mbps)** through a shared
 hub. The "WinTV-Nova-S2" is rebadged hardware that reports as "PCTV 461" (`2013:0462`),
@@ -149,12 +152,28 @@ sudo modprobe tbs5530
 Verified: builds clean on 7.0.0, registers `/dev/dvb/adapter0` with frontend0
 (DVB-T/T2/C/ATSC) and frontend1 (DVB-S/S2/S2X). DVB-S capture verified with `dvbhub`.
 
-### WinTV-Nova-S2 / PCTV 461 - working (patched kernel)
+### WinTV-Nova-S2 / PCTV 461 - working (patched kernel **or** DKMS)
 
-This unit (`2013:0462`) is a PCTV 461e v3 (em28178 + **m88ds3103c**). Support was
-added via patched custom kernel `7.0.0-20260615-sertac-dcn31fix` (see
-`kernel-deb-package-builder/patches/`). Verified: em28xx binds the device as
-"461e v3 (card=108)", m88ds3103c + ts2022 + a8293 chain up, `/dev/dvb/adapter1`.
+This unit (`2013:0462`) is a PCTV 461e v3 (em28178 + **m88ds3103c**).
+
+**Option A — patched custom kernel** (original Debian host):
+`7.0.0-20260615-sertac-dcn31fix` with linux-media patches (see
+`kernel-deb-package-builder/patches/` and [`docs/driver_bringup.md`](docs/driver_bringup.md)).
+
+**Option B — DKMS overlay on stock Ubuntu/Debian kernels** (preferred when you do
+not want a custom kernel). Builds `em28xx` + `m88ds3103` from torvalds sources
+matching the running `major.minor`, applies the same two patches, installs as
+`pctv461/2026.03.17`:
+
+```bash
+sudo ./scripts/install-pctv461-dkms.sh
+# Full Ubuntu stack (TBS + Dektec + PCTV DKMS):
+sudo ./scripts/ubuntu-dvb-stack-setup.sh
+# T14 / jammy HWE 6.8 helper:
+sudo ./scripts/t14-dvb-stack-setup.sh
+```
+
+Details and host notes (gediz-lenovo, T14): [`docs/ubuntu_stock_kernel_install.md`](docs/ubuntu_stock_kernel_install.md).
 
 ## TSDuck build & deploy
 
@@ -229,15 +248,16 @@ services, live signal metrics).
 - Satellite catalogue: `~/.config/dvbhub/satellites.json` (refresh with
   `update-satellites-json`).
 
-Terrestrial and Cable entries in the delivery picker currently show “coming soon” in
-the TUI; the web UI already exposes basic DVB-T/T2 and DVB-C capture forms.
+TUI covers Satellite / Terrestrial / Cable capture and playout wizards, plus a
+live **watch** path (tuner → tsp zap → player / GStreamer).
 
-Engine modules: `config`, `tsduck`, `usb`, `devices`, `transponders`, `pipeline`,
-`satellites`, `sat_capture`, `progress`, `signal`, `analyze`, `session`, `web`, `tui`.
+Engine modules include `config`, `tsduck`, `usb`, `devices`, `transponders`,
+`pipeline`, `satellites`, `sat_capture`, `terr_capture`, `cable_capture`,
+`watch*`, `progress`, `signal`, `analyze`, `session`, `web`, `tui`.
 
 > Functional test status (see [`docs/test_log.md`](docs/test_log.md)): DVB-S capture
-> and playout command structures verified on hardware (TBS5530 capture, DTU-315
-> playout). PCTV 461 satellite lock depends on cabling; loopback L2 tests pending.
+> and playout verified on hardware (TBS5530 / PCTV 461 capture, DTU-315 playout).
+> PCTV lock on stock Ubuntu T14 verified 2026-07-22 (Turksat 11054).
 
 ## Repository layout
 
@@ -260,12 +280,18 @@ Engine modules: `config`, `tsduck`, `usb`, `devices`, `transponders`, `pipeline`
 │   └── app/                    # Dockerfile + build scripts for dvbhub (musl static)
 ├── docs/
 │   ├── hardware_devices.md     # detected device inventory + evidence
-│   ├── driver_bringup.md       # step-by-step driver/firmware bring-up
+│   ├── driver_bringup.md       # step-by-step driver/firmware bring-up (custom kernel)
+│   ├── ubuntu_stock_kernel_install.md  # Ubuntu DKMS path (gediz / T14)
 │   ├── design_consideration.md # test methodology + architecture decisions
 │   ├── cli_tui_requirements.md # CLI/TUI spec and agreed decisions
 │   ├── reference_transponders.md
 │   ├── test_log.md
 │   └── tsduck_build.md
+├── drivers/pctv461/            # vendored 461e v3 patches + DKMS notes
+├── scripts/
+│   ├── install-pctv461-dkms.sh
+│   ├── ubuntu-dvb-stack-setup.sh
+│   └── t14-dvb-stack-setup.sh
 └── build/                      # (gitignored) cloned TSDuck source, bundle, dvbhub binary
 ```
 
@@ -276,14 +302,15 @@ Engine modules: `config`, `tsduck`, `usb`, `devices`, `transponders`, `pipeline`
 - [x] DTU-315 driver bring-up on 7.0.0 (Dektec LinuxSDK, `Dtu.ko`, L1 verified)
 - [x] TBS5530 driver bring-up (cxd28xx + TBS firmware, L1 verified)
 - [x] PCTV 461 / Nova-S2 driver bring-up (461e v3 kernel patch, L1 verified)
+- [x] PCTV 461 DKMS overlay on stock Ubuntu 6.8 / 7.0 (T14 + gediz-lenovo)
 - [x] All 3 devices L1-verified on `7.0.0-20260615-sertac-dcn31fix` (USB hub)
 - [x] Build TSDuck in Docker (Dektec enabled), deploy self-contained bundle to `/opt/tsduck`
 - [x] `dvbhub` engine + CLI (static musl binary, built in Docker)
 - [x] Device discovery + USB diagnostics
 - [x] Reference / catalogue transponders (Turksat 42E, KingOfSat refresh)
 - [x] DVB-S capture (CLI + web + TUI); manual SAT setup; per-TP output layout
+- [x] DVB-T / DVB-C capture + playout TUI paths; live watch
 - [x] DTU-315 playout (CLI + TUI)
 - [x] Local web UI (`serve`)
-- [ ] DVB-T / DVB-C capture TUI (web forms exist; TUI “coming soon” today)
 - [ ] DVB loopback test harness (L2a/b/c via `tscmp`)
 - [ ] CI: static cross-platform release builds
