@@ -78,6 +78,7 @@ pub fn cable_services_record() -> CaptureServicesRecord {
         services: Vec::new(),
         captured_at: chrono::Local::now().to_rfc3339(),
         tune: cable_tune(),
+        signal_stats: None,
     }
 }
 
@@ -88,6 +89,7 @@ pub fn terr_services_record() -> CaptureServicesRecord {
         services: Vec::new(),
         captured_at: chrono::Local::now().to_rfc3339(),
         tune: terr_tune(),
+        signal_stats: None,
     }
 }
 

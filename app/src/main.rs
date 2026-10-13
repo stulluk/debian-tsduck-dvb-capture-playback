@@ -13,6 +13,7 @@ mod channels;
 mod channels_import;
 mod config;
 mod devices;
+mod fe_stats;
 mod monitor;
 mod pipeline;
 mod progress;

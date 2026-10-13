@@ -249,6 +249,40 @@ dvbhub loopback --input some.ts --if-mhz 1200 \
     --seconds 15 --output loop.ts
 ```
 
+### Dependencies
+
+Build: only **Docker** on the host (`docker/app`, `docker/tsduck`,
+`docker/gst-mpegtslive`); toolchains and `-dev` packages stay in the images.
+
+Runtime (host):
+
+| Dependency | Debian/Ubuntu package | Used for |
+| ---------- | --------------------- | -------- |
+| TSDuck bundle (`tsp`, `tsanalyze`, `tslsdvb`, `tsdektec`) | built here, `/opt/tsduck` | all capture / playout / analysis |
+| GStreamer 1.x runtime + plugins | `gstreamer1.0-plugins-{base,good,bad}`, `gstreamer1.0-libav` | `dvbhub` is linked against GStreamer; `watch` GStreamer path |
+| `dvb-fe-tool` | `dvb-tools` | C/N, signal level and post-BER statistics sampled during capture |
+| `mpv` (or `vlc`) | `mpv` | default player for `watch` |
+| `ffmpeg` | `ffmpeg` | web UI HLS playback |
+| DKMS + kernel headers | `dkms`, `linux-headers-$(uname -r)` | out-of-tree tuner/modulator drivers |
+
+`scripts/ubuntu-dvb-stack-setup.sh` / `t14-dvb-stack-setup.sh` install the distro
+packages; `scripts/install-dvbhub-systemwide.sh` warns about missing runtime tools.
+Without `dvb-fe-tool`, captures still work but no signal statistics are recorded.
+
+### Signal statistics during capture
+
+TSDuck's own periodic status reports BER only as an integer percentage, too coarse
+for DVB-S2. While `tsp` records, `dvbhub` therefore runs `dvb-fe-tool -m` on the
+same frontend (read-only, it does not disturb tuning) and samples C/N, level and
+post-BER once per second. The first and last locked samples are dropped (settling
+/ teardown). The result is printed at the end of each capture:
+
+```
+[dvbhub] Signal stats (13 samples): C/N min/avg/max 11.76 / 11.91 / 12.04 dB, level avg -38.5 dBm, postBER avg 1.1e-3 max 4.1e-3
+```
+
+and stored as `signal_stats` in the capture's `*_services.json` sidecar.
+
 ### Capture TUI highlights
 
 Wizard: device → delivery (Satellite / Terrestrial / Cable) → satellite catalogue or

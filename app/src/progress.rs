@@ -8,6 +8,7 @@ use crate::analyze::{
     StreamSummary,
 };
 use crate::config::TsduckPaths;
+use crate::fe_stats::{self, FeMonitor, SignalStats};
 use crate::pipeline::CaptureParams;
 use crate::signal::{parse_dvbstatus_line, parse_signal_line, SignalStatus};
 use crate::tsduck;
@@ -108,6 +109,8 @@ pub struct CaptureRun {
     pub killed_by_watchdog: bool,
     pub last_signal: Option<SignalStatus>,
     pub last_summary: Option<StreamSummary>,
+    /// C/N / level / post-BER statistics sampled with `dvb-fe-tool` while locked.
+    pub signal_stats: Option<SignalStats>,
 }
 
 /// Upper bound for one bounded capture: lock wait + recording + teardown slack.
@@ -294,8 +297,23 @@ fn run_capture_inner(
     let last_signal: Arc<Mutex<Option<SignalStatus>>> = Arc::new(Mutex::new(None));
     let last_summary: Arc<Mutex<Option<StreamSummary>>> = Arc::new(Mutex::new(None));
 
+    // Frontend statistics sampler, started on first lock (dvb input only).
+    let fe_target = fe_stats::adapter_frontend_from_args(args);
+    let fe_monitor: Arc<Mutex<Option<FeMonitor>>> = Arc::new(Mutex::new(None));
+    if fe_target.is_some() && !FeMonitor::available() {
+        emit(
+            &events,
+            quiet,
+            CaptureEvent::Log(format!(
+                "{} not found — no C/N / BER statistics (apt install dvb-tools)",
+                fe_stats::FE_TOOL
+            )),
+        );
+    }
+
     let el = ever_locked.clone();
     let ls = last_signal.clone();
+    let fe_mon = fe_monitor.clone();
     let quiet_stderr = quiet;
     let ev_stderr = events.clone();
     let stderr_thread = thread::spawn(move || {
@@ -307,6 +325,25 @@ fn run_capture_inner(
                     el.store(true, Ordering::SeqCst);
                     if !lock_announced {
                         lock_announced = true;
+                        if let Some((adapter, frontend)) = fe_target {
+                            if FeMonitor::available() {
+                                match FeMonitor::start(adapter, frontend) {
+                                    Ok(mon) => {
+                                        if let Ok(mut guard) = fe_mon.lock() {
+                                            *guard = Some(mon);
+                                        }
+                                    }
+                                    Err(e) => emit(
+                                        &ev_stderr,
+                                        quiet_stderr,
+                                        CaptureEvent::Log(format!(
+                                            "cannot start {}: {e}",
+                                            fe_stats::FE_TOOL
+                                        )),
+                                    ),
+                                }
+                            }
+                        }
                     }
                 }
                 if let Ok(mut guard) = ls.lock() {
@@ -462,6 +499,16 @@ fn run_capture_inner(
         let _ = t.join();
     }
 
+    let signal_stats = fe_monitor
+        .lock()
+        .ok()
+        .and_then(|mut g| g.take())
+        .and_then(FeMonitor::stop);
+    if let Some(stats) = &signal_stats {
+        lastlog::event("capture", &stats.summary());
+        emit(&events, quiet, CaptureEvent::Log(stats.summary()));
+    }
+
     let locked = ever_locked.load(Ordering::SeqCst);
     let last = last_signal.lock().ok().and_then(|g| g.clone());
     let summary = last_summary.lock().ok().and_then(|g| g.clone());
@@ -484,6 +531,7 @@ fn run_capture_inner(
         killed_by_watchdog,
         last_signal: last,
         last_summary: summary,
+        signal_stats,
     })
 }
 

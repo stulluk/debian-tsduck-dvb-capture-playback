@@ -78,4 +78,19 @@ EOF
 chmod 644 /etc/profile.d/dvbhub.sh
 echo "Installed /etc/profile.d/dvbhub.sh"
 
+# Runtime dependencies (not installed automatically; report what is missing).
+# tool:package:purpose
+missing=0
+for dep in \
+  "dvb-fe-tool:dvb-tools:C/N + post-BER statistics during capture" \
+  "mpv:mpv:default player for dvbhub watch" \
+  "gst-launch-1.0:gstreamer1.0-tools:GStreamer watch path"; do
+  IFS=: read -r tool pkg purpose <<<"${dep}"
+  if ! command -v "${tool}" >/dev/null 2>&1; then
+    echo "WARNING: ${tool} not found (${purpose}) — install: apt install ${pkg}" >&2
+    missing=1
+  fi
+done
+[[ "${missing}" -eq 0 ]] && echo "Runtime dependencies: OK (dvb-fe-tool, mpv, gst-launch-1.0)"
+
 echo "System-wide dvbhub is ready (PATH should include $(dirname "${DEST_BIN}"))."

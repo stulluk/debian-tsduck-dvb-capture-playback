@@ -43,6 +43,9 @@ pub struct CaptureServicesRecord {
     pub services: Vec<ServiceInfo>,
     pub captured_at: String,
     pub tune: TuneRecord,
+    /// Signal statistics sampled during the capture (absent in older sidecars).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signal_stats: Option<crate::fe_stats::SignalStats>,
 }
 
 impl CaptureServicesRecord {
@@ -54,6 +57,7 @@ impl CaptureServicesRecord {
             services: summary.services.clone(),
             captured_at: chrono::Local::now().to_rfc3339(),
             tune: tp.clone(),
+            signal_stats: None,
         }
     }
 

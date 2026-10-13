@@ -138,7 +138,9 @@ pub fn capture_transponder(
         run.success && run.ever_locked,
     );
     if let Some(summary) = summary {
-        CaptureServicesRecord::from_summary(&summary, &tune).write_file(&services_path)?;
+        let mut record = CaptureServicesRecord::from_summary(&summary, &tune);
+        record.signal_stats = run.signal_stats.clone();
+        record.write_file(&services_path)?;
         run.last_summary = Some(summary);
     }
 
@@ -192,6 +194,7 @@ pub fn run_sat_capture(
                         killed_by_watchdog: false,
                         last_signal: None,
                         last_summary: None,
+                        signal_stats: None,
                     },
                     ts_path,
                     services_path,

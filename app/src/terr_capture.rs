@@ -60,7 +60,9 @@ pub fn capture_mux(
         run.success && run.ever_locked,
     );
     if let Some(summary) = summary {
-        CaptureServicesRecord::from_summary(&summary, &tune).write_file(&services_path)?;
+        let mut record = CaptureServicesRecord::from_summary(&summary, &tune);
+        record.signal_stats = run.signal_stats.clone();
+        record.write_file(&services_path)?;
         run.last_summary = Some(summary);
     }
 
