@@ -1,11 +1,12 @@
-# CLI / TUI requirements (draft)
+# CLI / TUI requirements
 
-Status: **user proposal + agent review** — not implemented yet.  
-Last updated: 2026-06-19.
+Status: **implemented** (spec agreed 2026-06-19, implemented through 2026-07).
+Last updated: 2026-10-13.
 
-This document captures the proposed top-level CLI shape, satellite database
-workflow, and TUI behaviour for `dvbhub`. It will drive ratatui work with
-TestBackend snapshot tests.
+This document captures the top-level CLI shape, satellite database workflow, and
+TUI behaviour for `dvbhub`. Sections were originally written as a draft; each one
+now notes what was actually implemented. The ratatui screens are covered by
+TestBackend tests (`cargo test`).
 
 ---
 
@@ -13,14 +14,14 @@ TestBackend snapshot tests.
 
 | Subcommand | Status | Purpose |
 |------------|--------|---------|
-| `capture` | existing (plain); TUI via `--tui` | Record TS from a tuner |
-| `playout` | rename from current `play` | Play a TS file through the modulator |
-| `watch` | **coming soon** | Live FTA service to player/HLS |
-| `update-satellites-json` | **new** | Refresh satellite / transponder database from KingOfSat |
+| `capture` | **done** (plain + `--tui`, S/T/C) | Record TS from a tuner |
+| `playout` | **done** (`play` kept as alias; plain + `--tui`, S/T/C) | Play a TS file through the modulator |
+| `watch` | **done** (plain + `--tui`, mpv / GStreamer) | Live FTA service to player/HLS |
+| `update-satellites-json` | **done** (`--satellite`, `--dry-run`) | Refresh satellite / transponder database from KingOfSat |
 
-**Note:** Today the binary also has `devices`, `transponders`, `analyze`,
-`capture-all`, `loopback`, `serve`. This spec does not say whether those stay
-as auxiliary commands or move under the four pillars above. See open questions.
+Auxiliary commands are kept as-is next to the four pillars: `devices`,
+`transponders`, `tsduck`, `capture-all`, `loopback`, `analyze`, `serve`,
+`completions`.
 
 Non-TUI capture (current plain progress + live analyze) **remains the default**.
 TUI is opt-in: `dvbhub capture --tui`.
@@ -105,7 +106,7 @@ for this project given existing code.
 
 ## 3. `update-satellites-json`
 
-Behaviour (draft):
+Behaviour (implemented):
 
 1. Read configured satellite list from the database file.
 2. For each satellite, map `longitude` → KingOfSat `pos` code (e.g. `42.0E` → `420`).
@@ -114,11 +115,12 @@ Behaviour (draft):
 5. Preserve per-satellite `lnb`, `diseqc`, and `name`.
 6. Write atomically; print summary (`updated N satellites, M transponders`).
 
-Flags (TBD):
+Flags:
 
-- `--satellite NAME` — refresh one entry only.
-- `--add 42.0E` — add a new satellite slot then fetch.
-- `--dry-run` — show diff without writing.
+- `--satellite NAME` — refresh one entry only (**done**).
+- `--dry-run` — report changes without writing (**done**).
+- `--add 42.0E` — add a new satellite slot then fetch (**not implemented**; add
+  the entry by hand in `satellites.json`, then refresh).
 
 ---
 
@@ -131,12 +133,16 @@ Flags (TBD):
 - Try to **read modulation parameters from the TS** automatically.
 - If detection fails: stop and ask user (TUI multi-select menus **or** CLI flags like `tsp`).
 
-### Existing code
+### Implemented
 
-`dvbhub play` already plays a file via DTU-315 with explicit
+`dvbhub playout` (alias `play`) plays a file via DTU-315 with explicit
 `--frequency-mhz`, `--modulation`, `--symbol-rate-ksps`, `--code-rate`.
+`playout --tui` picks the file in a file picker; when a capture sidecar
+(`*_services.json`, written by `capture`) exists next to the `.ts`, its recorded
+tune parameters pre-fill the modulation form. Otherwise the user fills the
+satellite / terrestrial / cable manual form.
 
-### Draft flow
+### Original draft flow
 
 ```
 playout FILE.ts
@@ -156,33 +162,39 @@ input or a reference transponder match.
 
 ## 5. `watch`
 
-**Coming soon** — placeholder subcommand or hidden until implemented.
-
-Existing `dvbhub watch --service …` CLI could become the non-TUI backend later.
+**Implemented.** `dvbhub watch` tunes, zaps one service with `tsp -P zap` and pipes
+it to a media player (`--player`, default mpv) or the GStreamer path. `watch --tui`
+shows the channel list from `~/.config/dvbhub/channels.json` (populated from
+capture sidecars). `--test` / `--sync-test` run headless A/V sync checks.
 
 ---
 
 ## 6. `capture` (non-TUI)
 
-**Unchanged** from current behaviour:
+Kept as the default (no TUI):
 
 - Flags / `--transponder` / explicit tune params.
 - Plain `[dvbhub]` progress on stderr.
 - Live `-P analyze --json` during capture.
 - Optional `--analyze` post-check if live analyze missed SDT.
+- Catalogue capture: `--satellite NAME --tp-frequency-mhz F` (one TP) or
+  `--satellite NAME --full-satellite [--resume] [--max-tps N]` (every TP).
 
 ---
 
 ## 7. `capture --tui`
 
-### Wizard steps (draft)
+### Wizard steps (implemented)
 
-1. **Device check** — list capture-capable tuners; user picks one (multi-select menu if several; error if none).
-2. **Delivery** — Satellite | Terrestrial | Cable (T/C may show “coming soon” initially).
+1. **Device check** — list capture-capable tuners; user picks one (error if none).
+2. **Delivery** — Satellite | Terrestrial | Cable.
 3. **If Satellite:**
-   - Pick satellite from `satellites.json` / `sat-tp.json`.
+   - Pick satellite from `satellites.json`, or **MANUAL SETUP** (single-page form:
+     frequency, SR, polarity, modulation, FEC, DiSEqC 1.0/1.1, LNB presets).
    - Ask mode: **Full satellite capture** vs **Single transponder capture**.
-4. **Run** — enter three-panel TUI (see below).
+4. **Terrestrial / Cable** — manual forms (frequency, bandwidth / SR, modulation).
+5. **Run** — three-panel TUI (see below). Top-right panel shows Quality (SNR),
+   Strength, BER and Bitrate.
 
 ### Three-panel layout (SAT)
 
@@ -203,20 +215,20 @@ Existing `dvbhub watch --service …` CLI could become the non-TUI backend later
 
 ### Full satellite vs TP capture
 
-| Mode | Behaviour (draft) |
+| Mode | Behaviour |
 |------|-------------------|
 | **Full sat** | For each TP on the satellite: tune → lock → (optional) list services → record N seconds → next TP. One output file per TP (matches existing web `capture-sat` naming). |
 | **TP capture** | User selects one TP → record N seconds → done. |
 
-### Keys (draft)
+### Keys (implemented)
 
 | Key | Action |
 |-----|--------|
-| `↑` / `↓` | Move selection (left panel in browse; wizard lists) |
+| `↑` / `↓` | Move selection (wizard lists, forms) |
+| `←` / `→` | Change option value in forms (e.g. DiSEqC, LNB preset) |
 | `Enter` | Confirm selection |
-| `Tab` | Switch focus panel (when in scan view) |
-| `q` / `Esc` | Quit / abort capture |
-| `?` | Help |
+| `Esc` | Back one wizard step |
+| `Esc` / `q` during capture | Asks Y/N, then stops `tsp` gracefully |
 
 Implementation: ratatui + shared `AppState` / events from `progress.rs` patterns;
 TestBackend snapshot tests for each screen.
@@ -225,9 +237,10 @@ TestBackend snapshot tests for each screen.
 
 ## 8. Test strategy (agreed)
 
-- **TestBackend** — render widgets to buffer; assert frame text in `cargo test`.
-- **Fixture replay** — feed recorded tsp stdout/stderr without hardware (later).
-- **`--plain`** — non-TUI regression path stays available.
+- **TestBackend** — render widgets to buffer; assert frame text in `cargo test` (**done**).
+- **Fixture replay** — feed recorded tsp stdout/stderr without hardware (not yet).
+- **Non-TUI path** — plain `capture` / `playout` stay the default regression path;
+  `--tui-auto` runs a non-interactive TUI smoke test.
 - User validates keybindings and “feel” on real terminal locally.
 
 ---
@@ -240,31 +253,34 @@ TestBackend snapshot tests for each screen.
 | Full sat output | **One `.ts` file per transponder** (same idea as current web SAT capture) |
 | SAT scan goal | **Both:** record TS **and** save service metadata (names, ids, provider, bitrate if available) as JSON per TP |
 | Per-TP folder layout | Under a satellite directory, **one subfolder per TP** containing both artefacts, e.g. `turksat42e/11054v30000/capture.ts` + `services.json` (exact names TBD) |
-| TUI v1 delivery | **DVB-S/S2 only**; Terrestrial and Cable show “coming soon” |
+| TUI v1 delivery | **DVB-S/S2 only** at first; Terrestrial and Cable were added later (done) |
 | Online TP source | **KingOfSat** primary (already in-tree); Enigma2 XML optional later |
 
-### Still open
+### Resolved since
 
-- Auxiliary commands (`serve`, `devices`, `analyze`, …): keep as-is?
-- Playout auto-detect: how much to infer from TS before prompting user?
-- `watch`: stub subcommand only until implemented?
+- Auxiliary commands are kept as-is.
+- Playout pre-fills parameters from the capture sidecar; no RF inference from TS
+  bitrate alone (bitrate does not determine symbol rate / FEC uniquely).
+- `watch` is fully implemented (no stub).
 
 ---
 
-## 10. Per-TP output layout (draft)
+## 10. Per-TP output layout (implemented)
 
-Full satellite capture writes under `<capture_dir>/<satellite_slug>/`:
+Full satellite and single-TP catalogue captures write under
+`<capture_dir>/<satellite_slug>/<freq><pol><sr>/` with timestamped files
+(`app/src/sat_capture.rs`):
 
 ```
 turksat42e/
   11054v30000/
-    capture.ts          # timed TS recording
-    services.json       # live analyze summary: ts_id, bitrate, services[]
+    turksat42e_11054_v_30000_20260619_120000.ts             # timed TS recording
+    turksat42e_11054_v_30000_20260619_120000_services.json  # ts_id, bitrate, services[], tune
   11096h30000/
-    capture.ts
-    services.json
-  …
+    …
 ```
+
+`--resume` skips TP folders that already contain a valid `.ts`.
 
 `services.json` schema (reuse `StreamSummary` from `analyze.rs`):
 
@@ -294,18 +310,17 @@ one selected transponder only.
 
 ## 11. Open questions (remaining)
 
-- Auxiliary commands (`serve`, `devices`, `analyze`, `loopback`, …): keep alongside the four pillars?
-- Playout: how much modulation can we infer from TS alone before prompting?
-- `watch`: visible stub with “coming soon” or hidden until ready?
+- `update-satellites-json --add <longitude>` (add a satellite without editing JSON).
+- Fixture-replay tests for `tsp` output parsing without hardware.
 
 ---
 
-## 12. Suggested implementation order
+## 12. Implementation order (all done)
 
-1. `update-satellites-json` CLI (reuse `satellites.rs`; no TUI yet).
+1. `update-satellites-json` CLI — **done**.
 2. CLI rename `play` → `playout` (+ `play` alias) — **done**.
-3. Per-TP folder output (`capture.ts` + `services.json`) for full-sat plain capture.
-4. `capture --tui` wizard shell + TestBackend tests (device + delivery + satellite pick).
-5. Three-panel SAT scan/capture view wired to real `tsp`.
-6. Playout auto-detect + TUI wizard (v1).
-7. `watch` subcommand stub → real implementation.
+3. Per-TP folder output (`.ts` + `_services.json`) for full-sat plain capture — **done**.
+4. `capture --tui` wizard shell + TestBackend tests — **done**.
+5. Three-panel SAT scan/capture view wired to real `tsp` — **done**.
+6. Playout sidecar pre-fill + TUI wizard — **done**.
+7. `watch` subcommand — **done**.

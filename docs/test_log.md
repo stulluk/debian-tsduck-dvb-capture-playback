@@ -281,7 +281,7 @@ Following the successful chain test, the Rust binary gained:
 - `capture` gained an optional `--analyze` flag to print the service list after a
   capture.
 
-The binary is built in Docker (`docker/app/indockerbuild.sh`) as a static musl
+At that time the binary was built in Docker (`docker/app/indockerbuild.sh`) as a static musl
 `x86_64` binary at `build/dvbhub`.
 
 ## Web UI (`dvbhub serve`) — 2026-06-16

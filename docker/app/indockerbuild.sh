@@ -2,7 +2,10 @@
 #
 # Compile dvbhub (GStreamer-linked glibc binary) inside the builder container.
 #
-# Usage: ./indockerbuild.sh
+# Usage: ./indockerbuild.sh [jobs]
+#   jobs  Parallel cargo jobs and Docker CPU limit. Default: 80% of host cores.
+#
+# A timestamped build log is written to <project>/build/logs/.
 #
 set -euo pipefail
 
@@ -12,19 +15,26 @@ IMAGE_NAME="dvbhub-builder-docker:latest"
 
 APP_DIR="${PROJECT_ROOT}/app"
 WORKDIR="${PROJECT_ROOT}/build"
+JOBS="${1:-$(( $(nproc) * 8 / 10 ))}"
+(( JOBS < 1 )) && JOBS=1
+LOG_DIR="${WORKDIR}/logs"
+LOG_FILE="${LOG_DIR}/dvbhub-build-$(date +%Y%m%d-%H%M%S).log"
 
 if ! docker image inspect "${IMAGE_NAME}" >/dev/null 2>&1; then
     echo "ERROR: image ${IMAGE_NAME} not found. Run ./dockerbuild.sh first." >&2
     exit 1
 fi
 
-mkdir -p "${WORKDIR}/cargo-home"
+mkdir -p "${WORKDIR}/cargo-home" "${LOG_DIR}"
 
 TTY_FLAGS=""
 [ -t 0 ] && TTY_FLAGS="-it"
 
-echo "=== Compiling dvbhub (glibc + GStreamer) ==="
+echo "=== Compiling dvbhub (glibc + GStreamer, jobs=${JOBS}) ==="
+echo "Log: ${LOG_FILE}"
+# shellcheck disable=SC2086  # TTY_FLAGS is intentionally word-split (empty or -it).
 docker run --rm ${TTY_FLAGS} \
+    --cpus="${JOBS}" \
     --user "$(id -u)":"$(id -g)" \
     --volume="/etc/passwd:/etc/passwd:ro" \
     --volume="/etc/group:/etc/group:ro" \
@@ -33,7 +43,7 @@ docker run --rm ${TTY_FLAGS} \
     --env CARGO_HOME="${WORKDIR}/cargo-home" \
     --env CARGO_TARGET_DIR="${WORKDIR}/target" \
     "${IMAGE_NAME}" \
-    cargo build --release
+    cargo build --release -j "${JOBS}" 2>&1 | tee "${LOG_FILE}"
 
 BIN="${WORKDIR}/target/release/dvbhub"
 if [[ ! -x "${BIN}" ]]; then

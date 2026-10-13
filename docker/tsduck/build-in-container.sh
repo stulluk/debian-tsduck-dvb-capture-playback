@@ -8,12 +8,13 @@
 #   WORKDIR       Writable work directory (mounted from host project/build).
 #   DTAPI_ORIGIN  Path to the Dektec LinuxSDK tarball (mounted read-only).
 #   TSDUCK_REF    Optional git ref/tag to build. Default: latest release tag.
-#   JOBS          Parallel build jobs. Default: nproc.
+#   JOBS          Parallel build jobs. Default: 80% of available cores.
 #
 set -euo pipefail
 
 WORKDIR="${WORKDIR:?WORKDIR must be set}"
-JOBS="${JOBS:-$(nproc)}"
+JOBS="${JOBS:-$(( $(nproc) * 8 / 10 ))}"
+(( JOBS < 1 )) && JOBS=1
 SRC="${WORKDIR}/tsduck-src"
 DIST="${WORKDIR}/tsduck-dist"
 REPO_URL="https://github.com/tsduck/tsduck.git"

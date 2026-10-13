@@ -21,5 +21,7 @@ RUN cargo install cargo-c
 WORKDIR /src
 RUN git clone --depth 1 https://gitlab.freedesktop.org/gstreamer/gst-plugins-rs.git
 
+# Parallel cargo jobs (passed by dockerbuild.sh; keeps the build under 80% of host cores).
+ARG JOBS=4
 WORKDIR /src/gst-plugins-rs
-RUN cargo cbuild -p gst-plugin-mpegtslive --release
+RUN cargo cbuild -p gst-plugin-mpegtslive --release -j "${JOBS}"
