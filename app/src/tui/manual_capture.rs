@@ -65,7 +65,7 @@ impl ManualCaptureForm {
             delivery_sel: 0,
             diseqc_committed: 0,
             diseqc_uncommitted: 0,
-            lnb_sel: 1, // Universal Ku (standard)
+            lnb_sel: 0, // Universal Ku (TSDuck "Extended", 10.7-12.75 GHz)
             sel: 0,
             editing: None,
             edit_buffer: String::new(),
@@ -109,14 +109,14 @@ impl ManualCaptureForm {
         LNB_PRESETS
             .get(self.lnb_sel)
             .map(|p| p.tsp_value)
-            .unwrap_or("Universal")
+            .unwrap_or("Extended")
     }
 
     fn lnb_label(&self) -> &str {
         LNB_PRESETS
             .get(self.lnb_sel)
             .map(|p| p.label)
-            .unwrap_or("Universal Ku (standard)")
+            .unwrap_or("Universal Ku (9750/10600, 10.7-12.75 GHz)")
     }
 
     fn is_choice_row(row: usize) -> bool {

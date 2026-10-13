@@ -728,11 +728,7 @@ async fn api_session_capture_sat(
             None => return error_json(StatusCode::NOT_FOUND, "satellite not found"),
         }
     };
-    let lnb = if sat.lnb.eq_ignore_ascii_case("universal") {
-        None
-    } else {
-        Some(sat.lnb.clone())
-    };
+    let lnb = Some(sat.tsp_lnb());
     let plan = SatCapturePlan {
         device_name: req.device_name,
         adapter: req.adapter,

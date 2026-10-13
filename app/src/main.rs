@@ -617,6 +617,24 @@ fn cmd_capture_full_satellite(paths: &TsduckPaths, args: &CaptureArgs) -> anyhow
         args.seconds
     );
 
+    if args.dry_run {
+        let limit = args.max_tps.unwrap_or(usize::MAX);
+        for tp in sat.transponders.iter().take(limit) {
+            println!(
+                "{}",
+                sat_capture::dry_run_command(
+                    &sat,
+                    &device,
+                    tp,
+                    args.seconds,
+                    args.signal_timeout,
+                    &output_root,
+                )
+            );
+        }
+        return Ok(());
+    }
+
     let transponders = sat.transponders.clone();
     let report = sat_capture::run_sat_capture(
         paths,
@@ -725,6 +743,21 @@ fn cmd_capture_catalogue_tp(
         output_root.display(),
         args.seconds
     );
+
+    if args.dry_run {
+        println!(
+            "{}",
+            sat_capture::dry_run_command(
+                &sat,
+                &device,
+                tp,
+                args.seconds,
+                args.signal_timeout,
+                &output_root,
+            )
+        );
+        return Ok(());
+    }
 
     let outcome = sat_capture::capture_transponder(
         paths,

@@ -271,6 +271,29 @@ pub fn run_sat_capture(
     })
 }
 
+/// The `tsp` command line a catalogue capture of `tp` would run (for `--dry-run`).
+pub fn dry_run_command(
+    sat: &Satellite,
+    device: &str,
+    tp: &SatTransponder,
+    seconds: u32,
+    signal_timeout_s: u32,
+    output_root: &Path,
+) -> String {
+    let ts_path = output_root
+        .join(tp_dir_name(tp))
+        .join(capture_ts_filename(sat, tp));
+    let params = capture_params_from_sat_tp(
+        sat,
+        device,
+        tp,
+        seconds,
+        signal_timeout_s,
+        ts_path.display().to_string(),
+    );
+    crate::tsduck::display_command("tsp", &params.to_tsp_args())
+}
+
 fn capture_params_from_sat_tp(
     sat: &Satellite,
     device: &str,
@@ -288,7 +311,7 @@ fn capture_params_from_sat_tp(
         symbol_rate: Some(tp.symbol_rate_ksps as u64 * 1_000),
         modulation: Some(tp.modulation.clone()),
         fec: Some(tp.fec.clone()),
-        lnb: Some(sat.lnb.clone()),
+        lnb: Some(sat.tsp_lnb()),
         satellite_number: Some(sat.diseqc),
         bandwidth_hz: None,
         guard_interval: None,

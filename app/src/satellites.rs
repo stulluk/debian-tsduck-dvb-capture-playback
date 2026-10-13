@@ -60,6 +60,22 @@ pub struct Satellite {
     pub transponders: Vec<SatTransponder>,
 }
 
+impl Satellite {
+    /// Value for `tsp -I dvb --lnb`.
+    ///
+    /// The catalogue token "universal" means a standard Ku universal LNB
+    /// (9750/10600 MHz, switch 11700, 10.7-12.75 GHz). In TSDuck the name
+    /// "Universal" is the *old* variant whose low band starts at 10.8 GHz, so
+    /// it rejects TPs such as Hot Bird 10719. Map it to TSDuck's "Extended".
+    pub fn tsp_lnb(&self) -> String {
+        if self.lnb.eq_ignore_ascii_case("universal") {
+            "Extended".to_string()
+        } else {
+            self.lnb.clone()
+        }
+    }
+}
+
 /// The persisted satellite catalogue.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SatelliteDb {
@@ -347,6 +363,22 @@ pub fn parse_ini_file(path: &Path) -> anyhow::Result<(String, Vec<SatTransponder
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn universal_lnb_maps_to_tsduck_extended() {
+        let mut sat = Satellite {
+            name: "Hot Bird 13E".into(),
+            longitude: "13.0E".into(),
+            lnb: "universal".into(),
+            diseqc: 0,
+            transponders: Vec::new(),
+        };
+        assert_eq!(sat.tsp_lnb(), "Extended");
+        sat.lnb = "0".into();
+        assert_eq!(sat.tsp_lnb(), "0");
+        sat.lnb = "9750,10600,11700".into();
+        assert_eq!(sat.tsp_lnb(), "9750,10600,11700");
+    }
 
     #[test]
     fn kingofsat_pos_normalizes_trailing_zero() {

@@ -11,15 +11,15 @@ pub struct LnbPreset {
 /// Known LNB types supported by TSDuck (`tsduck.lnbs.xml` table + legacy MHz strings).
 pub const LNB_PRESETS: &[LnbPreset] = &[
     LnbPreset {
-        label: "Universal Ku extended (Astra 19.2E)",
+        label: "Universal Ku (9750/10600, 10.7-12.75 GHz)",
         tsp_value: "Extended",
     },
     LnbPreset {
-        label: "Universal Ku (standard)",
+        label: "Universal Ku old (10.8-12.7 GHz)",
         tsp_value: "Universal",
     },
     LnbPreset {
-        label: "Universal Ku old (Astra / Enhanced)",
+        label: "Single LO 9750 (Astra / Enhanced, 10.7-11.7 GHz)",
         tsp_value: "Astra",
     },
     LnbPreset {
