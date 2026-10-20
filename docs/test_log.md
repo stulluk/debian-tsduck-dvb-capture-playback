@@ -348,6 +348,23 @@ Findings fixed on the way:
 - DTU-315 DVB-C support was not detected (TSDuck reports it as `qam:qam-a:dvb-c`).
 - WebSocket clients were disconnected when they lagged behind the event stream.
 
-Open: the DTU-315 sits behind a bus-powered USB hub and browns out ~17 s into
-modulation (`DTAPI_E_EVENT_POWER`, same as 2026-06-15); terrestrial / cable loopback
-and the real DTU-315 → TBS5530 L2c run wait for a direct USB port.
+### DTU-315 on a direct USB port (same day)
+
+The DTU-315 browned out behind a bus-powered hub (`DTAPI_E_EVENT_POWER`, as on
+2026-06-15); on a direct root port it is stable. Plug / unplug of both devices was
+picked up live by the web hot-plug monitor (badges + log).
+
+| Check | Result |
+| ----- | ------ |
+| Loopback DVB-T2 618 MHz (bench T2 file) | PASS — L2c 47810/47810; L2a judged against the source's own 3180 CC errors |
+| Loopback DVB-C 722 MHz 256-QAM (Vectra) | PASS — 19 services, L2c 92173/92173 |
+| Loopback DVB-T2, 3.9 Mb/s ARTE-only file | PASS — L2c 54616/54616, 0 CC errors, 22 s of media in a 20 s capture |
+| Web: playout + DVB-T scan + watch, Polish MUX3 (DVB-T 522 MHz, 24.88 Mb/s) | PASS — T2 then T fallback locked, 11 channels; TVP Info first frame 4.1 s, 44.8 s played in 44.8 s, 0 stalls, 0 dropped |
+
+Found and fixed: `tsp -O dektec` consumes a file at the channel bitrate, so a file
+slower than the channel (a single service cut out of a mux) was transmitted up to
+~6× faster than real time — the stalls and back-jumps seen in the browser. The DTU
+(DVB-T2) mutes its RF output on FIFO underflow, so `-P regulate` + `--stuffing` is
+not an option; dvbhub now measures the channel bitrate (short null playout) and the
+file's PCR bitrate and interleaves null packets with `--add-input-stuffing N/1000`.
+Files faster than the channel are rejected with a clear message.

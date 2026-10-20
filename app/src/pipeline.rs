@@ -265,9 +265,9 @@ impl PlayParams {
                 } else if self.modulation.eq_ignore_ascii_case("DVB-T2") {
                     append_dvbt2_dektec_args(&mut a, self);
                 }
-                a.push("--stuffing".into());
             }
         }
+        a.push("--stuffing".into());
         if let Some(l) = self.level_dbm_tenths {
             a.push("--level".into());
             a.push(l.to_string());
@@ -277,6 +277,84 @@ impl PlayParams {
         }
         a
     }
+}
+
+/// Null packets to add per `per` input packets so that a file of `file_bps`
+/// fills a channel of `channel_bps` at real-time speed. `None` when the file
+/// already matches the channel (within 1 %).
+pub fn input_stuffing(file_bps: u64, channel_bps: u64) -> Option<(u64, u64)> {
+    const PER: u64 = 1000;
+    if file_bps == 0 || file_bps * 100 >= channel_bps * 99 {
+        return None;
+    }
+    let nulls = ((channel_bps - file_bps) * PER + file_bps / 2) / file_bps;
+    (nulls > 0).then_some((nulls, PER))
+}
+
+/// TS bitrate the modulator will run at with these parameters (asked from
+/// TSDuck with a tiny null-packet playout; nothing meaningful is transmitted).
+pub fn probe_channel_bitrate(paths: &crate::config::TsduckPaths, p: &PlayParams) -> anyhow::Result<u64> {
+    let mut probe = p.clone();
+    probe.infinite = false;
+    probe.instant_detach = true;
+    let mut args = probe.to_tsp_args();
+    let o = args.iter().position(|a| a == "-O").unwrap_or(0);
+    args.splice(0..o, ["-I", "null", "-P", "until", "--packets", "2000"].map(String::from));
+    let out = crate::tsduck::tool_command(paths, "tsp").arg("--verbose").args(&args).output()?;
+    let text = String::from_utf8_lossy(&out.stderr);
+    text.lines()
+        .find_map(|l| l.split("setting output TS bitrate to ").nth(1))
+        .and_then(|v| v.split_whitespace().next())
+        .and_then(|v| v.replace(',', "").parse().ok())
+        .ok_or_else(|| anyhow::anyhow!("cannot determine the modulator bitrate: {}", text.trim()))
+}
+
+/// PCR-based TS bitrate of a file (first 100k packets).
+pub fn file_bitrate(paths: &crate::config::TsduckPaths, file: &str) -> anyhow::Result<u64> {
+    let v = crate::tsduck::run_json(
+        paths,
+        "tsp",
+        &["-I", "file", file, "-P", "until", "--packets", "100000", "-P", "analyze", "--json", "-O", "drop"],
+    )?;
+    v.get("ts")
+        .and_then(|t| t.get("bitrate"))
+        .and_then(|b| b.as_u64())
+        .filter(|b| *b > 0)
+        .ok_or_else(|| anyhow::anyhow!("no PCR bitrate found in {file}"))
+}
+
+/// Full `tsp` arguments for a playout that runs at real-time speed.
+///
+/// `tsp -O dektec` consumes the file at the channel bitrate, so a file slower
+/// than the channel (e.g. one service cut out of a mux) would be sent several
+/// times faster than real time. Null packets are interleaved with
+/// `--add-input-stuffing` so the content keeps its own rate. A file faster than
+/// the channel cannot be carried and is rejected. Returns the args and a note.
+pub fn playout_args(
+    paths: &crate::config::TsduckPaths,
+    p: &PlayParams,
+) -> anyhow::Result<(Vec<String>, String)> {
+    let channel = probe_channel_bitrate(paths, p)?;
+    let file = file_bitrate(paths, &p.input)?;
+    anyhow::ensure!(
+        file * 100 <= channel * 101,
+        "the file needs {:.2} Mb/s but the channel carries {:.2} Mb/s — choose a modulation with more capacity",
+        file as f64 / 1e6,
+        channel as f64 / 1e6
+    );
+    let mut args = p.to_tsp_args();
+    let note = match input_stuffing(file, channel) {
+        Some((nulls, per)) => {
+            args.splice(0..0, ["--add-input-stuffing".to_string(), format!("{nulls}/{per}")]);
+            format!(
+                "file {:.2} Mb/s on a {:.2} Mb/s channel: {nulls} null packets per {per} input packets",
+                file as f64 / 1e6,
+                channel as f64 / 1e6
+            )
+        }
+        None => format!("file {:.2} Mb/s matches the {:.2} Mb/s channel", file as f64 / 1e6, channel as f64 / 1e6),
+    };
+    Ok((args, note))
 }
 
 /// Dektec `-O dektec --bandwidth` expects MHz (`8`), not Hz (`8000000`).
@@ -502,5 +580,38 @@ mod tests {
         assert!(args.contains("--stuffing"));
         assert!(!args.contains("--symbol-rate"));
         assert!(!args.contains("-r "));
+    }
+
+    #[test]
+    fn playout_args_have_stuffing_for_every_delivery() {
+        for delivery in [PlayoutDelivery::Satellite, PlayoutDelivery::Terrestrial, PlayoutDelivery::Cable] {
+            let p = PlayParams {
+                input: "x.ts".into(),
+                infinite: true,
+                delivery,
+                frequency_hz: 618_000_000,
+                modulation: "DVB-T2".into(),
+                symbol_rate: Some(6_875_000),
+                code_rate: Some("2/3".into()),
+                bandwidth_hz: Some(8_000_000),
+                guard_interval: Some("19/256".into()),
+                plp_modulation: Some("64-QAM".into()),
+                j83: Some("A".into()),
+                level_dbm_tenths: None,
+                instant_detach: false,
+            };
+            let args = p.to_tsp_args().join(" ");
+            assert!(args.contains("--infinite -O dektec"), "{args}");
+            assert!(args.contains("--stuffing"), "{args}");
+        }
+    }
+
+    #[test]
+    fn input_stuffing_ratio() {
+        // 3.92 Mb/s ARTE on a 26.67 Mb/s DVB-T2 channel: ~5.8 nulls per packet.
+        assert_eq!(input_stuffing(3_917_670, 26_672_845), Some((5808, 1000)));
+        // Full mux at the channel rate: nothing to add.
+        assert_eq!(input_stuffing(24_880_000, 24_882_352), None);
+        assert_eq!(input_stuffing(0, 26_000_000), None);
     }
 }

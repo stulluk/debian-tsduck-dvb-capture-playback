@@ -713,7 +713,13 @@ impl SessionManager {
     /// Starts a playout; independent of the tuner slot.
     pub async fn start_playout(self: &Arc<Self>, params: PlayParams) -> anyhow::Result<()> {
         self.stop_playout().await;
-        let args = params.to_tsp_args();
+        let probe_paths = Arc::clone(&self.paths);
+        let probe_params = params.clone();
+        let (args, note) = tokio::task::spawn_blocking(move || {
+            crate::pipeline::playout_args(&probe_paths, &probe_params)
+        })
+        .await??;
+        self.action(format!("PLAYOUT rate: {note}"));
         self.action(format!(
             "PLAYOUT start {} @ {} MHz {}{}",
             params.input,

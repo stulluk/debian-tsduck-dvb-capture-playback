@@ -528,7 +528,17 @@ fn begin_playout(
     if let Some(m) = modulator {
         run_state.push_log(format!("Modulator: {} @ {}", m.model, m.address));
     }
-    let args = params.to_tsp_args();
+    let args = match crate::pipeline::playout_args(paths, params) {
+        Ok((args, note)) => {
+            run_state.push_log(note);
+            args
+        }
+        Err(e) => {
+            run_state.status = format!("Cannot start playout: {e:#}");
+            run_state.finished = true;
+            return Ok(());
+        }
+    };
     run_state.command = tsduck::display_command("tsp", &args);
     run_state.push_log(format!("$ {}", run_state.command));
     run_state.status = "Running tsp…".into();

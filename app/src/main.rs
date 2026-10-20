@@ -1361,12 +1361,12 @@ fn cmd_playout(args: PlayoutArgs) -> anyhow::Result<()> {
         // hang; an infinite playout stays attached so it keeps transmitting.
         instant_detach: !args.infinite,
     };
-    let tsp_args = params.to_tsp_args();
-
     if args.dry_run {
-        println!("{}", tsduck::display_command("tsp", &tsp_args));
+        println!("{}", tsduck::display_command("tsp", &params.to_tsp_args()));
         return Ok(());
     }
+    let (tsp_args, note) = pipeline::playout_args(&paths, &params)?;
+    eprintln!("[dvbhub] {note}");
 
     eprintln!(
         "[dvbhub] Playout: {} → {} MHz {} SR {} kSym/s FEC {} {}",
@@ -1471,9 +1471,9 @@ fn cmd_loopback(args: LoopbackArgs) -> anyhow::Result<()> {
         }
     }
 
-    let play_args = play.to_tsp_args();
     let capture_args = capture.to_tsp_args();
     if args.dry_run {
+        let play_args = play.to_tsp_args();
         println!("# 1) DTU-315 playout (background, --infinite):");
         println!("{}", tsduck::display_command("tsp", &play_args));
         println!("# 2) tuner re-capture (after {}s warmup):", args.warmup);
@@ -1481,7 +1481,8 @@ fn cmd_loopback(args: LoopbackArgs) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    println!("Starting DTU-315 playout ({}, attached, infinite)…", cat.as_str());
+    let (play_args, note) = pipeline::playout_args(&paths, &play)?;
+    println!("Starting DTU-315 playout ({}, attached, infinite): {note}", cat.as_str());
     let mut play_child = tsduck::tool_command(&paths, "tsp").args(&play_args).spawn()?;
     sleep(Duration::from_secs(args.warmup));
     if let Ok(Some(status)) = play_child.try_wait() {
