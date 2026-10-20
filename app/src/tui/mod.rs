@@ -11,6 +11,7 @@ mod manual_playout_satellite;
 mod manual_playout_terrestrial;
 mod manual_terrestrial;
 mod playout;
+mod scan;
 mod settings;
 mod watch;
 mod widgets;

@@ -6,6 +6,7 @@ use crate::channels_import::{self, ImportReport};
 use crate::config::{AppConfig, TsduckPaths};
 use crate::devices::Discovery;
 use crate::tui::capture::run_capture_tui;
+use crate::tui::scan::{FormAction, ScanForm, ScanRun};
 use crate::tui::widgets::{list_menu, list_viewport_rows, paragraph, KEYS_FOOTER_HEIGHT};
 use crate::watch;
 use crate::lastlog;
@@ -23,6 +24,8 @@ enum Screen {
     NoChannels,
     DeliveryPick,
     ChannelList,
+    ScanForm,
+    Scanning,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -68,6 +71,11 @@ struct WatchState {
     sel_channel: usize,
     status: String,
     last_import: ImportReport,
+    /// Channel-list filter typed after `/`.
+    query: String,
+    typing: bool,
+    scan_form: Option<ScanForm>,
+    scan_run: Option<ScanRun>,
 }
 
 /// Runs `dvbhub watch --tui`.
@@ -121,6 +129,10 @@ pub fn run_watch_tui(paths: TsduckPaths) -> anyhow::Result<()> {
         sel_channel: 0,
         status: status_from_import(&last_import, &cfg),
         last_import,
+        query: String::new(),
+        typing: false,
+        scan_form: None,
+        scan_run: None,
         db,
         discovery,
         paths,
@@ -187,6 +199,11 @@ fn run_loop(
     state: &mut WatchState,
 ) -> anyhow::Result<()> {
     loop {
+        if let Some(run) = state.scan_run.as_mut() {
+            if let Some((channels, locked, total)) = run.poll() {
+                finish_scan(state, channels, locked, total);
+            }
+        }
         term.draw(|f| draw(f, state))?;
 
         if !event::poll(Duration::from_millis(100))? {
@@ -200,6 +217,57 @@ fn run_loop(
         }
 
         match state.screen {
+            Screen::ScanForm => {
+                let action = state.scan_form.as_mut().map(|f| f.on_key(key));
+                match action {
+                    Some(FormAction::Back) | None => {
+                        state.scan_form = None;
+                        state.screen = home_screen(state);
+                    }
+                    Some(FormAction::Start) => start_scan(state),
+                    Some(FormAction::None) => {}
+                }
+            }
+            Screen::Scanning => {
+                if let Some(run) = state.scan_run.as_mut() {
+                    match key.code {
+                        KeyCode::Esc | KeyCode::Char('q') => run.confirm_stop = true,
+                        KeyCode::Char('y') | KeyCode::Char('Y') if run.confirm_stop => {
+                            run.cancel();
+                            run.confirm_stop = false;
+                        }
+                        KeyCode::Char('n') | KeyCode::Char('N') => run.confirm_stop = false,
+                        _ => {}
+                    }
+                }
+            }
+            Screen::ChannelList if state.typing => match key.code {
+                KeyCode::Esc => {
+                    state.typing = false;
+                    state.query.clear();
+                    state.sel_channel = 0;
+                    refresh_channel_list(state);
+                }
+                KeyCode::Enter => state.typing = false,
+                KeyCode::Backspace => {
+                    state.query.pop();
+                    state.sel_channel = 0;
+                    refresh_channel_list(state);
+                }
+                KeyCode::Char(c) => {
+                    state.query.push(c);
+                    state.sel_channel = 0;
+                    refresh_channel_list(state);
+                }
+                _ => {}
+            },
+            _ if matches!(key.code, KeyCode::Char('s') | KeyCode::Char('S')) => {
+                state.scan_form = Some(ScanForm::new(&state.discovery));
+                state.screen = Screen::ScanForm;
+            }
+            Screen::ChannelList if key.code == KeyCode::Char('/') => {
+                state.typing = true;
+            }
             Screen::NoChannels => match key.code {
                 KeyCode::Char('q') | KeyCode::Esc => break,
                 KeyCode::Char('c') | KeyCode::Char('C') => {
@@ -263,6 +331,10 @@ fn run_loop(
             },
             Screen::ChannelList => match key.code {
                 KeyCode::Char('q') => break,
+                KeyCode::Esc if !state.query.is_empty() => {
+                    state.query.clear();
+                    refresh_channel_list(state);
+                }
                 KeyCode::Esc => {
                     state.screen = Screen::DeliveryPick;
                 }
@@ -300,8 +372,12 @@ fn run_loop(
                         disable_raw_mode()?;
                         stdout().execute(LeaveAlternateScreen)?;
                         let t0 = std::time::Instant::now();
-                        let watch_result =
-                            watch::run_watch_for_tui(&paths, &ch, &discovery, false);
+                        let watch_result = watch::watch_channel(
+                            &paths,
+                            &ch,
+                            &discovery,
+                            &watch::WatchOpts::default(),
+                        );
                         lastlog::event(
                             "tui.watch",
                             &format!(
@@ -313,16 +389,17 @@ fn run_loop(
                         enable_raw_mode()?;
                         stdout().execute(EnterAlternateScreen)?;
                         term.clear()?;
-                        match watch_result {
-                            Ok(watch::WatchTuiOutcome::UserClosedVideo) => {
-                                state.status =
-                                    "Video closed — pick another channel (↑↓ Enter)".into();
+                        state.status = match watch_result {
+                            Ok(end) if end.user_closed => {
+                                "Video closed — pick another channel (↑↓ Enter)".into()
                             }
-                            Ok(watch::WatchTuiOutcome::Finished) => {
-                                state.status = format!("Finished: {}", ch.name);
-                            }
-                            Err(e) => state.status = format!("Watch failed: {e:#}"),
-                        }
+                            Ok(watch::WatchEnd {
+                                tsp_error: Some(err),
+                                ..
+                            }) => format!("Watch failed: {err}"),
+                            Ok(_) => format!("Finished: {}", ch.name),
+                            Err(e) => format!("Watch failed: {e:#}"),
+                        };
                     }
                 }
                 KeyCode::Char('i') | KeyCode::Char('I') => {
@@ -379,7 +456,7 @@ fn reimport(state: &mut WatchState) {
 }
 
 fn refresh_channel_list(state: &mut WatchState) {
-    state.channel_ids = filtered_channels(&state.db, state.active_filter)
+    state.channel_ids = filtered_channels(&state.db, state.active_filter, &state.query)
         .into_iter()
         .map(|c| c.id)
         .collect();
@@ -388,11 +465,71 @@ fn refresh_channel_list(state: &mut WatchState) {
     }
 }
 
-fn filtered_channels<'a>(db: &'a ChannelDb, filter: ListFilter) -> Vec<&'a SavedChannel> {
-    match filter.delivery() {
+fn filtered_channels<'a>(db: &'a ChannelDb, filter: ListFilter, query: &str) -> Vec<&'a SavedChannel> {
+    let list = match filter.delivery() {
         Some(d) => db.for_delivery(&d),
         None => db.sorted_all(),
+    };
+    let q = query.trim().to_lowercase();
+    if q.is_empty() {
+        return list;
     }
+    list.into_iter()
+        .filter(|c| {
+            c.name.to_lowercase().contains(&q)
+                || c.provider.to_lowercase().contains(&q)
+                || c.satellite.as_deref().is_some_and(|s| s.to_lowercase().contains(&q))
+        })
+        .collect()
+}
+
+/// Screen to return to when leaving the scan screens.
+fn home_screen(state: &WatchState) -> Screen {
+    if state.db.channels.is_empty() {
+        Screen::NoChannels
+    } else {
+        Screen::DeliveryPick
+    }
+}
+
+fn start_scan(state: &mut WatchState) {
+    let Some(form) = state.scan_form.as_mut() else {
+        return;
+    };
+    match form.targets(&state.discovery) {
+        Ok((targets, opts, label)) => {
+            lastlog::event("tui.watch", &format!("scan start {} target(s) {label}", targets.len()));
+            state.scan_run = Some(ScanRun::start(state.paths.clone(), targets, opts, label));
+            state.scan_form = None;
+            state.screen = Screen::Scanning;
+        }
+        Err(e) => form.message = format!("Cannot start: {e:#}"),
+    }
+}
+
+fn finish_scan(state: &mut WatchState, channels: Vec<SavedChannel>, locked: usize, total: usize) {
+    state.scan_run = None;
+    let found = channels.len();
+    let base = state.db.channels.iter().map(|c| c.scan_index).max().unwrap_or(0);
+    let batch = channels
+        .into_iter()
+        .enumerate()
+        .map(|(i, mut c)| {
+            c.scan_index = base + 1 + i as u32;
+            c
+        })
+        .collect();
+    let added = state.db.add_batch(batch);
+    if added > 0 {
+        if let Err(e) = state.db.save() {
+            state.status = format!("Saving channels failed: {e}");
+        }
+    }
+    state.status = format!("Scan done: {locked}/{total} locked, {found} channel(s), {added} new");
+    lastlog::event("tui.watch", &state.status);
+    state.delivery_options = build_delivery_options(&state.db);
+    state.sel_delivery = 0;
+    state.screen = home_screen(state);
 }
 
 fn selected_channel(state: &WatchState) -> Option<&SavedChannel> {
@@ -419,6 +556,16 @@ fn draw(f: &mut Frame, state: &WatchState) {
         Screen::NoChannels => draw_no_channels(f, area, state),
         Screen::DeliveryPick => draw_delivery_pick(f, area, state),
         Screen::ChannelList => draw_channel_list(f, area, state),
+        Screen::ScanForm => {
+            if let Some(form) = &state.scan_form {
+                form.draw(f, area);
+            }
+        }
+        Screen::Scanning => {
+            if let Some(run) = &state.scan_run {
+                run.draw(f, area);
+            }
+        }
     }
 }
 
@@ -438,7 +585,7 @@ fn draw_no_channels(f: &mut Frame, area: Rect, state: &WatchState) {
         f,
         chunks[1],
         "keys",
-        "i import from captures · c scan (capture --tui) · q quit",
+        "s scan for channels · i import from captures · c capture TUI · q quit",
     );
 }
 
@@ -461,7 +608,7 @@ fn draw_delivery_pick(f: &mut Frame, area: Rect, state: &WatchState) {
         chunks[1],
         "keys",
         &format!(
-            "↑↓ PgUp/PgDn · Enter list · i re-import · c scan · q quit · {}",
+            "↑↓ PgUp/PgDn · Enter list · s scan · i re-import · c capture · q quit · {}",
             state.status
         ),
     );
@@ -469,16 +616,26 @@ fn draw_delivery_pick(f: &mut Frame, area: Rect, state: &WatchState) {
 
 fn draw_channel_list(f: &mut Frame, area: Rect, state: &WatchState) {
     let chunks = Layout::vertical([Constraint::Min(4), Constraint::Length(KEYS_FOOTER_HEIGHT)]).split(area);
-    let channels = filtered_channels(&state.db, state.active_filter);
+    let channels = filtered_channels(&state.db, state.active_filter, &state.query);
     let items: Vec<String> = channels.iter().map(|c| c.list_label()).collect();
-    let title = format!("Watch — {}", state.active_filter.label(&state.db));
+    let title = if state.typing || !state.query.is_empty() {
+        format!(
+            "Watch — {} — filter: {}{} ({} match)",
+            state.active_filter.label(&state.db),
+            state.query,
+            if state.typing { "_" } else { "" },
+            channels.len()
+        )
+    } else {
+        format!("Watch — {}", state.active_filter.label(&state.db))
+    };
     list_menu(f, chunks[0], &title, &items, state.sel_channel);
     paragraph(
         f,
         chunks[1],
         "keys",
         &format!(
-            "↑↓ PgUp/PgDn · Enter watch · Esc back · i import · c scan · q quit · {}",
+            "↑↓ PgUp/PgDn · Enter watch · / filter · Esc back · s scan · c capture · q quit · {}",
             state.status
         ),
     );
