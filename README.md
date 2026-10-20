@@ -279,9 +279,12 @@ from the browser.
 (`$XDG_RUNTIME_DIR/dvbhub-hls`). Video is re-encoded to 8-bit H.264 because
 broadcast video is often interlaced open-GOP H.264 (no IDR frames, rejected by
 browser decoders), MPEG-2 (not playable in browsers at all) or 10-bit HEVC. The
-quality selector next to the player offers **720p** (default, ≈ 0.5 core) or
-**Source** — the native resolution (HotBird 4K1: 3840×2160 50p, ≈ 6.5 cores,
-first frame ≈ 4 s, no dropped frames). Audio becomes AAC.
+quality selector next to the player offers **720p** (default, x264, ≈ 0.5 core) or
+**Source** — the native resolution. With a VAAPI GPU (`/dev/dri/renderD128`,
+checked at start-up) Source decodes, deinterlaces and encodes entirely on the GPU
+at 25 fps: UHD 3840×2160 plays with ffmpeg at ≈ 5 % of one core instead of 6–10
+cores with x264 (which remains the fallback without VAAPI). An integrated GPU
+encodes UHD H.264 at only ~45–55 fps, hence 25 fps. Audio becomes AAC.
 
 ### Channel database
 

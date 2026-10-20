@@ -634,11 +634,12 @@ impl SessionManager {
         // Audio is AAC (browsers cannot play MPEG-1/2 audio). Only the first
         // video and audio streams are mapped; teletext/data would break the muxer.
         let quality = self.config.read().await.web_quality.clone();
-        let video = web_video_args(&quality);
+        let profile = web_video_args(&quality, vaapi_h264_available());
+        let (pre_input, video) = (profile.pre_input, profile.video);
         let ffmpeg = format!(
-            "ffmpeg -hide_banner -loglevel error -fflags +genpts+discardcorrupt+nobuffer \
+            "ffmpeg -hide_banner -loglevel error {pre_input} -fflags +genpts+discardcorrupt+nobuffer \
              -analyzeduration 1M -probesize 1M -i pipe:0 -map 0:v:0 -map 0:a:0? \
-             {video} -tune zerolatency -g 25 -keyint_min 25 -sc_threshold 0 \
+             {video} -g 25 \
              -c:a aac -b:a 128k -ac 2 -f hls -hls_time 1 -hls_list_size 6 \
              -hls_flags delete_segments+omit_endlist+independent_segments \
              -hls_segment_type fmp4 -hls_fmp4_init_filename init.mp4 {}",
@@ -647,9 +648,10 @@ impl SessionManager {
         args.extend(["-P".into(), "zap".into(), spec.service_id.to_string(), "-O".into(), "fork".into(), ffmpeg]);
         let url = format!("/hls/s{}-{id}/stream.m3u8", spec.service_id);
         self.action(format!(
-            "PLAY start '{}' sid={} quality={quality} on {}",
+            "PLAY start '{}' sid={} quality={quality} encoder={} on {}",
             spec.name,
             spec.service_id,
+            profile.encoder,
             spec.params.device_name.clone().unwrap_or_default()
         ));
         let mut child = spawn_tsp(&self.paths, &args)?;
@@ -874,22 +876,81 @@ fn pol_initial(p: &str) -> char {
     p.chars().next().unwrap_or('?').to_ascii_uppercase()
 }
 
-/// ffmpeg video options for a browser playback quality: "720p" (default) or
-/// "source" (native resolution, e.g. 3840x2160 for UHD channels; a 4K50 HEVC
-/// source encodes ~2x faster than real time with x264 superfast). Interlaced
-/// sources are deinterlaced (yadif only touches interlaced frames).
-fn web_video_args(quality: &str) -> String {
-    let (filter, preset, rate, max, buf) = match quality {
-        // The comma inside min() is escaped for ffmpeg; the single quotes keep
-        // the backslash through the shell that tsp's fork output uses.
-        "source" => ("yadif=0:-1:1", "superfast", "16M", "20M", "32M"),
-        _ => (r"yadif=0:-1:1,scale=-2:min(720\,ih)", "veryfast", "3M", "3500k", "6M"),
-    };
-    // 8-bit output: 10-bit sources (UHD HEVC Main 10) would otherwise give High 10
-    // H.264, which browsers do not decode.
-    format!(
-        "-vf '{filter}' -pix_fmt yuv420p -c:v libx264 -preset {preset} -b:v {rate} -maxrate {max} -bufsize {buf}"
-    )
+/// ffmpeg options for one browser playback quality.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct VideoProfile {
+    /// Options placed before `-i` (hardware device / decoder setup).
+    pre_input: String,
+    /// Video filter + encoder options.
+    video: String,
+    /// Encoder name for the log.
+    encoder: &'static str,
+}
+
+/// DRM render node used for VAAPI.
+const VAAPI_DEVICE: &str = "/dev/dri/renderD128";
+
+/// True when ffmpeg can encode H.264 with VAAPI on [`VAAPI_DEVICE`]
+/// (checked once with a tiny test encode).
+fn vaapi_h264_available() -> bool {
+    static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *AVAILABLE.get_or_init(|| {
+        let ok = std::path::Path::new(VAAPI_DEVICE).exists()
+            && std::process::Command::new("ffmpeg")
+                .args(["-hide_banner", "-loglevel", "error", "-init_hw_device"])
+                .arg(format!("vaapi=va:{VAAPI_DEVICE}"))
+                .args([
+                    "-filter_hw_device", "va", "-f", "lavfi", "-i", "color=s=256x144:d=0.2",
+                    "-vf", "format=nv12,hwupload", "-c:v", "h264_vaapi", "-f", "null", "-",
+                ])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .is_ok_and(|s| s.success());
+        crate::lastlog::event("web", &format!("VAAPI H.264 encoder available: {ok}"));
+        ok
+    })
+}
+
+/// ffmpeg options for a browser playback quality.
+///
+/// * "720p" (default): software x264, ~0.5 core.
+/// * "source": native resolution. With a VAAPI GPU the whole chain stays on the
+///   GPU (decode, deinterlace, H.264 encode; CPU ~5 % for UHD) at 25 fps — an
+///   integrated GPU encodes 3840x2160 at ~45-55 fps, too close to 50p. Frames the
+///   GPU cannot decode (e.g. MPEG-2) are decoded in software and uploaded.
+///   Without VAAPI, x264 superfast at the source frame rate (~6-10 cores for
+///   UHD).
+///
+/// Output is 8-bit (10-bit sources would otherwise give High 10, which browsers
+/// do not decode); interlaced frames are deinterlaced.
+fn web_video_args(quality: &str, vaapi: bool) -> VideoProfile {
+    match (quality, vaapi) {
+        ("source", true) => VideoProfile {
+            pre_input: format!(
+                "-init_hw_device vaapi=va:{VAAPI_DEVICE} -filter_hw_device va \
+                 -hwaccel vaapi -hwaccel_device va -hwaccel_output_format vaapi"
+            ),
+            video: "-vf 'format=nv12|vaapi,hwupload,fps=25,deinterlace_vaapi=auto=1,scale_vaapi=format=nv12' \
+                    -c:v h264_vaapi -bf 0 -b:v 12M -maxrate 16M -bufsize 24M"
+                .into(),
+            encoder: "h264_vaapi",
+        },
+        ("source", false) => VideoProfile {
+            pre_input: String::new(),
+            video: "-vf 'yadif=0:-1:1' -pix_fmt yuv420p -c:v libx264 -preset superfast \
+                    -tune zerolatency -keyint_min 25 -sc_threshold 0 -b:v 16M -maxrate 20M -bufsize 32M"
+                .into(),
+            encoder: "libx264",
+        },
+        _ => VideoProfile {
+            pre_input: String::new(),
+            // The comma inside min() is escaped for ffmpeg; the single quotes keep
+            // the backslash through the shell that tsp's fork output uses.
+            video: r"-vf 'yadif=0:-1:1,scale=-2:min(720\,ih)' -pix_fmt yuv420p -c:v libx264 -preset veryfast -tune zerolatency -keyint_min 25 -sc_threshold 0 -b:v 3M -maxrate 3500k -bufsize 6M".into(),
+            encoder: "libx264",
+        },
+    }
 }
 
 /// Stops a job: cancel flag, SIGTERM to its child, then wait for the task.
@@ -1157,12 +1218,16 @@ mod tests {
 
     #[test]
     fn web_quality_profiles() {
-        assert!(web_video_args("720p").contains(r"min(720\,ih)"));
-        assert_eq!(web_video_args("1080p"), web_video_args("720p"));
-        let src = web_video_args("source");
-        assert!(!src.contains("scale"));
-        assert!(src.contains("superfast"));
-        assert_eq!(web_video_args("bogus"), web_video_args("720p"));
+        let p720 = web_video_args("720p", true);
+        assert!(p720.video.contains(r"min(720\,ih)") && p720.encoder == "libx264");
+        assert!(p720.pre_input.is_empty(), "720p stays in software even with a GPU");
+        let gpu = web_video_args("source", true);
+        assert_eq!(gpu.encoder, "h264_vaapi");
+        assert!(gpu.pre_input.contains("-hwaccel vaapi"));
+        assert!(gpu.video.contains("hwupload") && gpu.video.contains("fps=25"));
+        let cpu = web_video_args("source", false);
+        assert!(cpu.video.contains("superfast") && !cpu.video.contains("scale"));
+        assert_eq!(web_video_args("bogus", true), web_video_args("720p", true));
     }
 }
 
