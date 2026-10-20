@@ -4,8 +4,10 @@
 //! (random start offset, null-packet stuffing, loop seams), so equality is
 //! checked in layers (see `docs/design_consideration.md`):
 //!
-//! * **L2a link health** — the re-capture locked and has no continuity errors
-//!   after the lead-in (first 2 % of packets).
+//! * **L2a link health** — the re-capture has no continuity errors after the
+//!   lead-in (first 2 % of packets) beyond what the source itself contains:
+//!   an infinite playout repeats the source's own errors once per loop and
+//!   adds one discontinuity per PID at every loop seam.
 //! * **L2b structure** — same transport-stream id and the same service ids.
 //! * **L2c elementary stream** — every video packet payload of the re-capture
 //!   (after the lead-in) exists bit-for-bit in the source.
@@ -37,6 +39,10 @@ pub struct LinkCheck {
     pub packets: u64,
     pub cc_errors_total: usize,
     pub cc_errors_after_lead_in: usize,
+    /// Continuity errors already present in the source file.
+    pub source_cc_errors: usize,
+    /// Upper bound explained by the source (errors × loops + PIDs × seams).
+    pub expected_max: usize,
     pub pass: bool,
 }
 
@@ -68,11 +74,12 @@ impl CompareReport {
     pub fn print(&self) {
         let v = |b: bool| if b { "PASS" } else { "FAIL" };
         println!(
-            "L2a link      {}  {} packets, {} CC errors after lead-in ({} total)",
+            "L2a link      {}  {} packets, {} CC errors after lead-in (≤ {} explained by the source, which has {})",
             v(self.l2a.pass),
             self.l2a.packets,
             self.l2a.cc_errors_after_lead_in,
-            self.l2a.cc_errors_total
+            self.l2a.expected_max,
+            self.l2a.source_cc_errors
         );
         println!(
             "L2b structure {}  TS id {:?} vs {:?}, {} vs {} services",
@@ -114,11 +121,19 @@ pub fn compare(paths: &TsduckPaths, source: &Path, capture: &Path) -> anyhow::Re
     let lead_in = (packets as f64 * LEAD_IN) as u64;
     let cc = continuity_error_indices(paths, capture)?;
     let after = cc.iter().filter(|&&i| i > lead_in).count();
+    let src_cc = continuity_error_indices(paths, source)?.len();
+    let src_packets = (std::fs::metadata(source)?.len() / PKT as u64).max(1);
+    let (src_pids, _) = pid_census(source)?;
+    let loops = packets.div_ceil(src_packets) as usize;
+    let seams = loops; // the capture can span one more seam than full loops
+    let expected_max = src_cc * loops + src_pids * seams;
     let l2a = LinkCheck {
         packets,
         cc_errors_total: cc.len(),
         cc_errors_after_lead_in: after,
-        pass: packets > 0 && after == 0,
+        source_cc_errors: src_cc,
+        expected_max,
+        pass: packets > 0 && after <= expected_max,
     };
 
     let pid = video_pid(paths, source)?;
@@ -167,6 +182,22 @@ fn continuity_error_indices(paths: &TsduckPaths, file: &Path) -> anyhow::Result<
         .filter_map(|l| l.split("packet index: ").nth(1)?.split(", PID").next())
         .filter_map(|n| n.chars().filter(char::is_ascii_digit).collect::<String>().parse().ok())
         .collect())
+}
+
+/// Number of distinct PIDs (excluding null packets) and packet count of a file.
+fn pid_census(file: &Path) -> anyhow::Result<(usize, u64)> {
+    let mut r = BufReader::with_capacity(1 << 20, std::fs::File::open(file)?);
+    let mut buf = [0u8; PKT];
+    let mut seen = vec![false; 0x2000];
+    let mut packets = 0u64;
+    while r.read_exact(&mut buf).is_ok() {
+        packets += 1;
+        if buf[0] == 0x47 {
+            seen[((usize::from(buf[1] & 0x1F)) << 8) | usize::from(buf[2])] = true;
+        }
+    }
+    seen[0x1FFF] = false;
+    Ok((seen.iter().filter(|s| **s).count(), packets))
 }
 
 /// Busiest video PID of a file (from `tsp -P analyze --json`, first 200k packets).
