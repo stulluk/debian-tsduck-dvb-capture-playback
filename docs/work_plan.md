@@ -83,7 +83,7 @@ ticked only after it was verified as described in the "Verify" column.
 | P8 docs | done | README, requirements, test log |
 | D1–D9 | fixed | see `docs/test_log.md` 2026-10-20 |
 
-Pending (hardware): DTU-315 on a direct USB port → T2 / cable loopback with
-`dvbhub loopback --delivery …` (L2a/b/c), web T/C scan and capture through the
-loopback, and a plug / unplug check of the web badges.
-
+Hardware checks completed later the same day with the DTU-315 on a direct USB
+port: T2 / cable loopback (L2a/b/c PASS), web DVB-T scan + watch through the
+loopback, plug / unplug picked up by the web badges. Not covered: a satellite
+loopback (the DVB-S input carries the Hot Bird dish cable).
