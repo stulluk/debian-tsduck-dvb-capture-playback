@@ -5,11 +5,11 @@ kernel**, and to build **`dvbhub`** — a hybrid Rust application (single CLI + 
 web UI + optional terminal UI) that detects those devices and drives DVB transport-stream
 **capture** and **playback** through [TSDuck](https://tsduck.io/).
 
-> Status: TSDuck is built and deployed; `dvbhub` runs on real hardware. Capture
-> (DVB-S/S2, DVB-T/T2, DVB-C) works via CLI, web UI, and TUI (`capture --tui`).
-> **Playout** to the DTU-315 works via CLI and TUI (`playout --tui`) for satellite,
-> terrestrial and cable. Live **watch** (tuner → `tsp` zap → player / GStreamer) is
-> available from CLI and TUI. Open items: automated loopback test harness, CI.
+> Status (2026-10-20): TSDuck is built and deployed; `dvbhub` runs on real hardware.
+> Capture, channel scan and live watch (DVB-S/S2, DVB-T/T2, DVB-C) work from the CLI,
+> the TUIs and the browser UI; DTU-315 playout (S/T/C) works from all three. Live TV
+> plays in the browser (HLS, first frame ≈ 3–4 s). A loopback harness checks L2a/b/c.
+> See [`docs/work_plan.md`](docs/work_plan.md) for the verification matrix.
 
 ## Background
 
@@ -198,71 +198,110 @@ three devices are visible — `tslsdvb` lists the TBS5530 (two frontends) and PC
 
 ## Application (`dvbhub`)
 
-An `x86_64` glibc binary (dynamically linked against GStreamer), built in Docker, that runs on the host
-and drives TSDuck via subprocesses. It resolves TSDuck from `$DVBHUB_TSDUCK_DIR`,
-then `/opt/tsduck`, then `$PATH`.
+An `x86_64` glibc binary built in Docker. No media libraries are linked: TSDuck,
+the players and ffmpeg run as subprocesses. TSDuck is resolved from
+`$DVBHUB_TSDUCK_DIR`, then `/opt/tsduck`, then `$PATH`.
 
 ```
 cd docker/app
-./dockerbuild.sh                 # build the Rust builder image (Debian + GStreamer)
+./dockerbuild.sh                 # build the Rust builder image (Debian + Rust)
 ./indockerbuild.sh [jobs]        # compile -> build/dvbhub, then install system-wide
                                  # to /usr/local/bin/dvbhub when passwordless sudo works
                                  # jobs default: 80% of host cores; log in build/logs/
+sudo ./scripts/install-dvbhub-systemwide.sh   # refresh the system-wide install only
+scripts/ci-build.sh              # what CI runs: tests (warnings = errors) + dist/ binary
+```
 
-# refresh system-wide install without rebuilding:
-sudo ./scripts/install-dvbhub-systemwide.sh
+### Command line
 
-# discovery / info:
-dvbhub devices                   # discover usable DVB devices (+ USB warnings)
-dvbhub devices --json            # machine-readable
-dvbhub transponders              # the fixed Turksat 42E reference TPs
-dvbhub tsduck                    # show resolved TSDuck dir + version
+```
+# discovery / info
+dvbhub devices [--json]          # usable DVB devices (+ USB-present-but-unusable warnings)
+dvbhub tsduck                    # resolved TSDuck dir + version
 dvbhub update-satellites-json    # refresh ~/.config/dvbhub/satellites.json (KingOfSat)
 
-# capture (tuner -> file); use --dry-run to print the tsp command:
-dvbhub capture --transponder 1 --device-name /dev/dvb/adapter0 \
-    --seconds 6 --output ref.ts
+# capture (tuner -> file); --dry-run prints the tsp command
+dvbhub capture --satellite "Hot Bird 13E" --tp-frequency-mhz 10719 --seconds 600
+dvbhub capture --satellite "Hot Bird 13E" --full-satellite --seconds 60 --resume
+dvbhub capture --tui             # wizard: tuner -> S/T/C -> catalogue or MANUAL SETUP
 
-# interactive capture wizard (DVB-S; manual setup + catalogue satellites):
-dvbhub capture --tui
+# channel scan (saves FTA TV + radio with --save)
+dvbhub scan --satellite "Hot Bird 13E" --save            # every TP of the satellite
+dvbhub scan --satellite "Hot Bird 13E" --tp 10719v --tp 10930h
+dvbhub scan --terrestrial [--frequency-mhz 618] --save   # empty = UHF 21-69, T2 then T
+dvbhub scan --cable --frequency-mhz 722 --symbol-rate-ksps 6875 --modulation 256-QAM --save
 
-# playout (file -> DTU-315 modulator, L-band IF):
+# watch (tuner -> tsp zap -> mpv, else vlc, or --player "…")
+dvbhub watch --tui               # channel list: / filter, Enter watch, s scan
+dvbhub watch --channel "TVP INFO HD"
+dvbhub watch --channel "TVP INFO HD" --test --duration 15   # headless: ffmpeg decodes, PASS/FAIL
+
+# playout (file -> DTU-315)
+dvbhub playout --tui             # picks parameters from the capture's _services.json
 dvbhub playout --input some.ts --frequency-mhz 1200 \
     --modulation DVB-S2-8PSK --symbol-rate-ksps 30000 --code-rate 3/4 --infinite
 
-# capture one catalogue TP, or a whole satellite into per-TP folders:
-dvbhub capture --satellite "Hot Bird 13E" --tp-frequency-mhz 10719 --seconds 600
-dvbhub capture --satellite "Hot Bird 13E" --full-satellite --seconds 600 --resume
+# loopback (DTU-315 plays, a tuner re-captures, then L2a/L2b/L2c comparison)
+dvbhub loopback --input some.ts --if-mhz 1200 --modulation DVB-S2-8PSK \
+    --symbol-rate-ksps 30000 --code-rate 3/4 --seconds 15 --output loop.ts
+dvbhub loopback --delivery terrestrial --input t2.ts --frequency-mhz 618 \
+    --modulation DVB-T2 --seconds 15 --output loop_t2.ts
+dvbhub compare --source some.ts --capture loop.ts       # comparison only
 
-# interactive playout wizard:
-dvbhub playout --tui
-
-# live watch of an FTA service (mpv by default) or the channel-list TUI:
-dvbhub watch --tui
-
-# local web UI (browser on localhost):
-dvbhub serve
-
-# loopback test (DTU-315 plays out, a tuner re-captures):
-dvbhub loopback --input some.ts --if-mhz 1200 \
-    --modulation DVB-S2-8PSK --symbol-rate-ksps 30000 --code-rate 3/4 \
-    --seconds 15 --output loop.ts
+# browser UI
+dvbhub serve                     # http://127.0.0.1:8080 (localhost only)
 ```
+
+### Web UI (`dvbhub serve`)
+
+Landing page with four tiles (devices, capture, playback, watch). A hot-plug
+monitor (netlink uevents, no polling) keeps the top-right badges current — one badge
+per physical device — and greys out tiles the connected hardware cannot serve. The
+header shows the running job (recording / scanning / watching / playout) with a
+stop button; the activity log at the bottom streams every tool line (also written
+to `~/.config/dvbhub/dvbhub.log`).
+
+- **TS capture:** tuner → S / T / C tabs (from the tuner's delivery systems).
+  Satellite: single TP (reference list or satellite catalogue), whole satellite, or
+  manual TP ("save as reference transponder"); satellite and TP add / edit / remove,
+  KingOfSat import. Live countdown, signal metrics and saved file list.
+- **TS playback:** DTU-315 playout for satellite, terrestrial and cable. Selecting a
+  capture fills the form from its `_services.json`; "save as reference capture".
+- **Watch TV:** channel list per delivery, grouped by satellite, with a filter; click
+  plays in the browser. Scan tab for S / T / C with live per-frequency results.
+- **Settings:** capture directory.
+
+Tuner jobs (monitor / capture / scan / watch) share the tuner and replace each other;
+DTU-315 playout runs independently, so a loopback (play out + capture or scan) works
+from the browser.
+
+**Browser playback:** `tsp -P zap` → ffmpeg → HLS (fMP4, 1 s segments) on tmpfs
+(`$XDG_RUNTIME_DIR/dvbhub-hls`). Video is re-encoded to 720p H.264 (≈ 0.5 core):
+broadcast video is often interlaced open-GOP H.264 (no IDR frames, rejected by
+browser decoders) or MPEG-2 (not playable in browsers at all). Audio becomes AAC.
+
+### Channel database
+
+`~/.config/dvbhub/channels.json`. Each channel stores the full tuning (satellite,
+LNB, DiSEqC, frequency, polarity, symbol rate, modulation …) and the model of the
+tuner that found it. Playback picks a tuner by delivery and model, never by the
+`/dev/dvb/adapterN` number (which follows plug order). Scans keep only services
+that carry video (TV) or audio (radio): data services labelled "TV" in the SDT and
+FTA entries that are off air are skipped.
 
 ### Dependencies
 
-Build: only **Docker** on the host (`docker/app`, `docker/tsduck`,
-`docker/gst-mpegtslive`); toolchains and `-dev` packages stay in the images.
+Build: only **Docker** on the host (`docker/app`, `docker/tsduck`); toolchains and
+`-dev` packages stay in the images.
 
 Runtime (host):
 
 | Dependency | Debian/Ubuntu package | Used for |
 | ---------- | --------------------- | -------- |
-| TSDuck bundle (`tsp`, `tsanalyze`, `tslsdvb`, `tsdektec`) | built here, `/opt/tsduck` | all capture / playout / analysis |
-| GStreamer 1.x runtime + plugins | `gstreamer1.0-plugins-{base,good,bad}`, `gstreamer1.0-libav` | `dvbhub` is linked against GStreamer; `watch` GStreamer path |
+| TSDuck bundle (`tsp`, `tsanalyze`, `tslsdvb`, `tsdektec`) | built here, `/opt/tsduck` | all capture / playout / scan / analysis |
 | `dvb-fe-tool` | `dvb-tools` | C/N, signal level and post-BER statistics sampled during capture |
-| `mpv` (or `vlc`) | `mpv` | default player for `watch` |
-| `ffmpeg` | `ffmpeg` | web UI HLS playback |
+| `mpv` (or `vlc`) | `mpv` | player for `watch` (mpv preferred, vlc fallback, or `--player`) |
+| `ffmpeg` (with libx264) | `ffmpeg` | browser playback (HLS), `watch --test` |
 | DKMS + kernel headers | `dkms`, `linux-headers-$(uname -r)` | out-of-tree tuner/modulator drivers |
 
 `scripts/ubuntu-dvb-stack-setup.sh` / `t14-dvb-stack-setup.sh` install the distro
@@ -272,80 +311,70 @@ Without `dvb-fe-tool`, captures still work but no signal statistics are recorded
 ### Signal statistics during capture
 
 TSDuck's own periodic status reports BER only as an integer percentage, too coarse
-for DVB-S2. While `tsp` records, `dvbhub` therefore runs `dvb-fe-tool -m` on the
-same frontend (read-only, it does not disturb tuning) and samples C/N, level and
-post-BER once per second. The first and last locked samples are dropped (settling
-/ teardown). The result is printed at the end of each capture:
+for DVB-S2. While `tsp` records, `dvbhub` runs `dvb-fe-tool -m` on the same frontend
+(read-only, it does not disturb tuning) and samples C/N, level and post-BER once per
+second. The first and last locked samples are dropped (settling / teardown):
 
 ```
 [dvbhub] Signal stats (13 samples): C/N min/avg/max 11.76 / 11.91 / 12.04 dB, level avg -38.5 dBm, postBER avg 1.1e-3 max 4.1e-3
 ```
 
-and stored as `signal_stats` in the capture's `*_services.json` sidecar.
+The same values are stored as `signal_stats` in the capture's `*_services.json`.
 
-### Capture TUI highlights
+### Loopback comparison (L2a / L2b / L2c)
 
-Wizard: device → delivery (Satellite / Terrestrial / Cable) → satellite catalogue or
-**MANUAL SETUP** → full-sat or single-TP mode → three-panel run view (TP queue,
-services, live signal metrics).
+A loopback re-capture is never byte-identical to its source (random start offset,
+null-packet stuffing, loop seams), so `dvbhub compare` checks layers:
 
-- **MANUAL SETUP:** single-page form (frequency, SR, polarity, modulation, FEC,
-  DiSEqC 1.0/1.1 via ←→, LNB presets).
-- **Run screen:** Quality (SNR), Strength, BER, Bitrate in the top-right panel.
-- **Keys:** `Esc` back one step; during capture `Esc`/`q` asks Y/N to stop `tsp`.
-- Satellite catalogue: `~/.config/dvbhub/satellites.json` (refresh with
-  `update-satellites-json`).
+- **L2a link** — no continuity errors after the lead-in (first 2 % of packets);
+- **L2b structure** — same transport-stream id and service ids;
+- **L2c ES** — every video payload packet of the re-capture exists bit-for-bit in the
+  source (≥ 99.9 %).
 
-TUI covers Satellite / Terrestrial / Cable capture and playout wizards, plus a
-live **watch** path (tuner → tsp zap → player / GStreamer).
+### TUI highlights
 
-Engine modules include `config`, `tsduck`, `usb`, `devices`, `transponders`,
-`pipeline`, `satellites`, `sat_capture`, `terr_capture`, `cable_capture`,
-`watch*`, `progress`, `signal`, `analyze`, `session`, `web`, `tui`.
-
-> Functional test status (see [`docs/test_log.md`](docs/test_log.md)): DVB-S capture
-> and playout verified on hardware (TBS5530 / PCTV 461 capture, DTU-315 playout).
-> PCTV lock on stock Ubuntu T14 verified 2026-07-22 (Turksat 11054).
+- Capture: device → delivery → satellite catalogue or **MANUAL SETUP** (one-page
+  form, DiSEqC 1.0/1.1, LNB presets) → full satellite or single TP → three-panel run
+  view (TP queue, services, Quality / Strength / BER / Bitrate). Settings (`s`):
+  capture directory and seconds per TP (←/→, accelerates when held, up to 1 h).
+- Watch: channel list per delivery, `/` filter, Enter watches in mpv / vlc, closing
+  the player returns to the list; `s` scans (satellite catalogue, UHF, cable).
+- Playout: file picker; parameters from the `_services.json` sidecar or S/T/C forms.
+- `Esc` goes back one screen; while recording / playing out / scanning it asks Y/N.
 
 ## Repository layout
 
 ```
 .
 ├── README.md
+├── .github/workflows/build.yml # CI: tests + Linux x86_64 binary (release on v* tags)
 ├── app/                        # dvbhub Rust application
 │   ├── Cargo.toml
-│   ├── data/kingofsat/         # KingOfSat INI sources for satellite catalogue
+│   ├── data/kingofsat/         # KingOfSat INI seeds for the satellite catalogue
 │   ├── src/
 │   │   ├── main.rs             # CLI entry point
-│   │   ├── config.rs, tsduck.rs, usb.rs, devices.rs
-│   │   ├── pipeline.rs, progress.rs, signal.rs, analyze.rs
-│   │   ├── satellites.rs, sat_capture.rs, transponders.rs
-│   │   ├── terr_capture.rs, cable_capture.rs, terrestrial.rs, cable.rs
-│   │   ├── watch*.rs, channels*.rs  # live watch (tsp zap -> player / GStreamer)
-│   │   ├── session.rs, web.rs  # local web UI + session manager
-│   │   └── tui/                # ratatui capture/playout/watch wizards
-│   └── web/                    # static assets for the browser UI
+│   │   ├── config.rs, tsduck.rs, usb.rs, devices.rs, monitor.rs (hot-plug)
+│   │   ├── pipeline.rs, progress.rs, signal.rs, fe_stats.rs, analyze.rs
+│   │   ├── satellites.rs, sat_capture.rs, terr_capture.rs, cable_capture.rs
+│   │   ├── channel_scan.rs, channels.rs, channels_import.rs
+│   │   ├── watch.rs            # tsp zap | mpv / vlc (+ --test via ffmpeg)
+│   │   ├── loopback_compare.rs # L2a / L2b / L2c
+│   │   ├── session.rs, web.rs  # web UI server and job manager
+│   │   └── tui/                # ratatui capture / playout / watch / scan screens
+│   └── web/                    # browser UI: index.html, app.css, js/*.js, hls.min.js
 ├── docker/
 │   ├── tsduck/                 # Dockerfile + build/deploy scripts for TSDuck
-│   ├── app/                    # Dockerfile + build scripts for dvbhub (glibc + GStreamer)
-│   └── gst-mpegtslive/         # builds the mpegtslivesrc GStreamer plugin (watch path)
+│   └── app/                    # Dockerfile + build scripts for dvbhub
 ├── completions/                # bash completion (generated by `dvbhub completions bash`)
-├── docs/
-│   ├── hardware_devices.md     # detected device inventory + evidence
-│   ├── driver_bringup.md       # step-by-step driver/firmware bring-up (custom kernel)
-│   ├── ubuntu_stock_kernel_install.md  # Ubuntu DKMS path (gediz / T14)
-│   ├── design_consideration.md # test methodology + architecture decisions
-│   ├── cli_tui_requirements.md # CLI/TUI spec and agreed decisions
-│   ├── reference_transponders.md
-│   ├── test_log.md
-│   └── tsduck_build.md
+├── docs/                       # design, requirements, work plan, test log, bring-up notes
 ├── drivers/pctv461/            # vendored 461e v3 patches + DKMS notes
 ├── scripts/
+│   ├── ci-build.sh             # CI build (also runnable locally)
 │   ├── install-dvbhub-systemwide.sh  # /usr/local/bin/dvbhub + completion + TSDuck links
 │   ├── install-pctv461-dkms.sh
 │   ├── ubuntu-dvb-stack-setup.sh
 │   └── t14-dvb-stack-setup.sh
-└── build/                      # (gitignored) TSDuck source/bundle, dvbhub binary, logs/
+└── build/, dist/               # (gitignored) TSDuck source/bundle, binaries, logs
 ```
 
 ## Roadmap
@@ -356,14 +385,13 @@ Engine modules include `config`, `tsduck`, `usb`, `devices`, `transponders`,
 - [x] TBS5530 driver bring-up (cxd28xx + TBS firmware, L1 verified)
 - [x] PCTV 461 / Nova-S2 driver bring-up (461e v3 kernel patch, L1 verified)
 - [x] PCTV 461 DKMS overlay on stock Ubuntu 6.8 / 7.0 (T14 + gediz-lenovo)
-- [x] All 3 devices L1-verified on `7.0.0-20260615-sertac-dcn31fix` (USB hub)
 - [x] Build TSDuck in Docker (Dektec enabled), deploy self-contained bundle to `/opt/tsduck`
-- [x] `dvbhub` engine + CLI (glibc + GStreamer binary, built in Docker)
-- [x] Device discovery + USB diagnostics
-- [x] Reference / catalogue transponders (Turksat 42E, KingOfSat refresh)
-- [x] DVB-S capture (CLI + web + TUI); manual SAT setup; per-TP output layout
-- [x] DVB-T / DVB-C capture + playout TUI paths; live watch
-- [x] DTU-315 playout (CLI + TUI)
-- [x] Local web UI (`serve`)
-- [ ] DVB loopback test harness (L2a/b/c via `tscmp`)
-- [ ] CI: Linux `x86_64` release builds (GStreamer linkage rules out a fully static binary)
+- [x] `dvbhub` engine + CLI, TUIs and web UI
+- [x] Device discovery, hot-plug monitor, USB diagnostics
+- [x] Satellite catalogue (KingOfSat), reference TPs, per-TP output layout + sidecars
+- [x] Capture S/T/C (CLI, TUI, web) with signal statistics
+- [x] Channel scan S/T/C (CLI, TUI, web); channel DB with satellite / LNB / tuner model
+- [x] Live watch: mpv / vlc (CLI, TUI) and in the browser (HLS)
+- [x] DTU-315 playout S/T/C (CLI, TUI, web)
+- [x] Loopback harness with L2a / L2b / L2c comparison (`loopback`, `compare`)
+- [x] CI: Linux `x86_64` build (`.github/workflows/build.yml`)

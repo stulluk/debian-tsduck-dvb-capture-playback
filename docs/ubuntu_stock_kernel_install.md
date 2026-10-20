@@ -25,7 +25,7 @@ modules. No GRUB / initramfs custom kernel entry is required.
 
 Full stack installed 2026-07 without a custom kernel:
 
-1. Distro packages: `dkms`, matching `linux-headers-$(uname -r)`, `dvb-tools`, GStreamer/mpv as needed.
+1. Distro packages: `dkms`, matching `linux-headers-$(uname -r)`, `dvb-tools`, `mpv` (or `vlc`) and `ffmpeg` as needed.
 2. Firmware: `dvb-demod-m88ds3103c.fw`, TBS `dvb-usb-id5530.fw` + `dvb-demod-m88rs6060.fw`.
 3. Dektec LinuxSDK `2026.05.0` → `dektec_dtu` DKMS (`Install_Dtu`; headers precheck patched to look for `build/Makefile`).
 4. TBS5530 → `koreapyj/cxd28xx` DKMS.

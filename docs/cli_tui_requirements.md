@@ -16,12 +16,12 @@ TestBackend tests (`cargo test`).
 |------------|--------|---------|
 | `capture` | **done** (plain + `--tui`, S/T/C) | Record TS from a tuner |
 | `playout` | **done** (`play` kept as alias; plain + `--tui`, S/T/C) | Play a TS file through the modulator |
-| `watch` | **done** (plain + `--tui`, mpv / GStreamer) | Live FTA service to player/HLS |
+| `watch` | **done** (plain + `--tui`, mpv / vlc; browser via `serve`) | Live FTA service to a player |
 | `update-satellites-json` | **done** (`--satellite`, `--dry-run`) | Refresh satellite / transponder database from KingOfSat |
 
 Auxiliary commands are kept as-is next to the four pillars: `devices`,
-`transponders`, `tsduck`, `capture-all`, `loopback`, `analyze`, `serve`,
-`completions`.
+`transponders`, `tsduck`, `capture-all`, `scan`, `loopback`, `compare`, `analyze`,
+`serve`, `completions`.
 
 Non-TUI capture (current plain progress + live analyze) **remains the default**.
 TUI is opt-in: `dvbhub capture --tui`.
@@ -162,10 +162,26 @@ input or a reference transponder match.
 
 ## 5. `watch`
 
-**Implemented.** `dvbhub watch` tunes, zaps one service with `tsp -P zap` and pipes
-it to a media player (`--player`, default mpv) or the GStreamer path. `watch --tui`
-shows the channel list from `~/.config/dvbhub/channels.json` (populated from
-capture sidecars). `--test` / `--sync-test` run headless A/V sync checks.
+**Implemented (rewritten 2026-10-20).** `dvbhub watch` runs
+`tsp -I dvb … -P zap <sid> -O file | <player> -` — mpv, else vlc, or `--player "…"`.
+dvbhub only supervises the two processes: closing the player stops `tsp`; `tsp`
+ending (no lock, busy tuner) stops the player and reports the error. Both children
+die with dvbhub (PR_SET_PDEATHSIG), so a tuner is never left busy.
+
+- mpv opens video in ≈ 2 s: the default lavf probe (5 MB) waited ~8 s on channels
+  whose AC-3 tracks never yield parameters; dvbhub passes a 2 MB / 1 s probe.
+- `--test --duration N` replaces the player with `ffmpeg -f null` and fails unless
+  video frames decode in real time (headless verification).
+- mpv writes its own log to `/tmp/dvbhub_mpv_log.txt` (VO/AO, dropped frames).
+
+`watch --tui`: delivery → channel list (`[SAT]` rows show satellite, TP and sid),
+`/` filters by name / provider / satellite, Enter watches, closing the player returns
+to the list, `s` opens the scan form (satellite catalogue, UHF band or frequencies,
+cable frequencies; live progress; Esc asks Y/N).
+
+The embedded GStreamer player of the Cursor sessions was removed: the freezes it was
+built to debug were caused by the PC's audio stack (PipeWire / ALC897), not by the
+TS pipeline.
 
 ---
 

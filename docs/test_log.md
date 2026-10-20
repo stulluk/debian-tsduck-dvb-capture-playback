@@ -302,3 +302,52 @@ Verified on PCTV 461 (multiswitch, DiSEqC port A):
 API routes: `/api/session/tune`, `/capture`, `/scan`, `/play` (+ DELETE stops), `/ws`.
 
 Known: only one tuner session at a time (tune / capture / scan / play are mutually exclusive).
+
+## 2026-10-13 — Hot Bird 13E (TBS5530, motorised dish fixed on 13E)
+
+- `--lnb universal` was TSDuck's *old* Universal LNB (low band from 10.8 GHz) and
+  rejected 10719 V; catalogue "universal" now maps to TSDuck `Extended`.
+- 20 NC+ TPs × 15 s before/after dish fine-tuning: C/N +0.93 dB on average, mid-capture
+  continuity errors on 10719 V 2146 → 1. Then 20 TPs × 10 min (88 GiB) recorded;
+  9 TPs showed short C/N dips (10.0–10.4 dB) with errors, 11 were clean.
+
+## 2026-10-20 — feature-complete pass (see `docs/work_plan.md`)
+
+Hardware: TBS5530 with Hot Bird 13E on the DVB-S input; DTU-315 on USB.
+
+| Area | Check | Result |
+| ---- | ----- | ------ |
+| Unit tests | `scripts/ci-build.sh` (tests, warnings = errors) | PASS — 66 tests, 0 warnings |
+| Watch CLI | `watch --test` TVP INFO HD (10719 V), 15 s | PASS — lock 0.7 s, 363 frames, 0 decode errors |
+| Watch mpv | TVP INFO HD / TVP Polonia / ARTE, video out after | PASS — 2.0–2.7 s (was 7.9 s: lavf probe) |
+| Watch cleanup | SIGINT and SIGKILL to dvbhub | PASS — tsp and mpv gone in both cases |
+| Scan CLI | Hot Bird 13E, 123 TPs | PASS — 76 locked, 476 FTA channels saved |
+| Scan filter | data services typed "TV", off-air SDT entries | PASS — excluded (no video stream) |
+| Web watch | TVP INFO HD in the browser | PASS — first frame 3.3 s, 1280×720, 1 dropped frame in 14 s |
+| Web zap | TVP INFO HD → ARTE (other TP) | PASS — new picture after 3.8 s |
+| Web capture | 10719 V, 12 s from the capture page | PASS — standard name, sidecar with satellite / LNB / signal_stats |
+| Web API | 21 scripted checks (CRUD, validation, stop, path traversal) | PASS — 21/21 |
+| Web playout | sidecar → form (10719 V → IF 969 MHz, DVB-S2-8PSK, 27500, 5/6) | PASS |
+| TUI watch | filter `/TVP INFO`, Enter → mpv titled "TVP INFO HD", close → list | PASS |
+| TUI scan | form, progress, Esc → Y/N, stop, tsp cleaned up | PASS |
+| TUI capture | Hot Bird → single TP 10719, 6 s | PASS — "Last capture: 1 OK" |
+| Compare | synthetic loopback (window of source, nulls removed) | PASS — L2c 55863/55863 |
+| Compare | negative controls (live recordings of the same TP) | FAIL as expected — L2c 5.6 % / 6.9 % |
+
+Findings fixed on the way:
+
+- Browser playback: broadcast H.264 is interlaced open-GOP (no IDR); hls.js marks the
+  first sample non-key and Chrome's decoder rejects it; MPEG-2 channels cannot play in
+  browsers at all. Web playback now re-encodes to 720p H.264 (≈ 0.5 core, IDR each
+  second, fMP4 HLS segments on tmpfs).
+- Web jobs used to stop each other (`stop_all`): starting a capture stopped the DTU-315
+  playout, so loopback was impossible from the browser. Tuner and modulator jobs are
+  now independent.
+- Web satellite capture used another naming scheme and wrote no sidecar; it now uses
+  the CLI/TUI capture engine.
+- DTU-315 DVB-C support was not detected (TSDuck reports it as `qam:qam-a:dvb-c`).
+- WebSocket clients were disconnected when they lagged behind the event stream.
+
+Open: the DTU-315 sits behind a bus-powered USB hub and browns out ~17 s into
+modulation (`DTAPI_E_EVENT_POWER`, same as 2026-06-15); terrestrial / cable loopback
+and the real DTU-315 → TBS5530 L2c run wait for a direct USB port.
