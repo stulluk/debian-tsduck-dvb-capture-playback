@@ -1,0 +1,28 @@
+# Linux x86_64 build of dvbhub (tests + release binary). Tags v* publish a release.
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+permissions:
+  contents: write
+
+jobs:
+  linux-x86_64:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test and build in Docker
+        run: scripts/ci-build.sh "$(nproc)"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dvbhub-linux-x86_64
+          path: dist/*
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
