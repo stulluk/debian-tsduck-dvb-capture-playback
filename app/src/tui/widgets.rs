@@ -16,13 +16,7 @@ pub const INFO_FOOTER_HEIGHT: u16 = 3;
 
 /// Renders a titled list menu; `selected` is the highlighted row index.
 /// Long lists scroll automatically so the selection stays visible.
-pub fn list_menu(
-    frame: &mut Frame,
-    area: Rect,
-    title: &str,
-    items: &[String],
-    selected: usize,
-) {
+pub fn list_menu(frame: &mut Frame, area: Rect, title: &str, items: &[String], selected: usize) {
     if area.height < 3 || area.width < 3 {
         return;
     }
@@ -38,7 +32,7 @@ pub fn list_menu(
     let max_label = area.width.saturating_sub(4) as usize;
     let rows: Vec<ListItem> = items
         .iter()
-        .map(|label| ListItem::new(Line::from(truncate_end(label, max_label))))
+        .map(|label| ListItem::new(Line::from(truncate_tail(label, max_label))))
         .collect();
 
     let list = List::new(rows)
@@ -79,11 +73,8 @@ pub fn wizard_list_layout(area: Rect, show_summary: bool) -> WizardListLayout {
             keys: chunks[2],
         }
     } else {
-        let chunks = Layout::vertical([
-            Constraint::Min(4),
-            Constraint::Length(KEYS_FOOTER_HEIGHT),
-        ])
-        .split(area);
+        let chunks = Layout::vertical([Constraint::Min(4), Constraint::Length(KEYS_FOOTER_HEIGHT)])
+            .split(area);
         WizardListLayout {
             list: chunks[0],
             summary: None,
@@ -133,12 +124,28 @@ fn clip_body(text: &str, max_width: usize, max_lines: usize) -> String {
         if line.chars().count() <= max_width {
             lines_out.push(line.to_string());
         } else {
-            lines_out.push(truncate_end(line, max_width));
+            lines_out.push(truncate_tail(line, max_width));
         }
     }
     lines_out.join("\n")
 }
 
+/// Shortens `s` to `max_chars`, keeping the start (labels, frequencies) and
+/// marking the cut with a trailing `…`.
+pub fn truncate_tail(s: &str, max_chars: usize) -> String {
+    let count = s.chars().count();
+    if count <= max_chars {
+        return s.to_string();
+    }
+    if max_chars == 0 {
+        return String::new();
+    }
+    let head: String = s.chars().take(max_chars - 1).collect();
+    format!("{head}…")
+}
+
+/// Shortens `s` to `max_chars`, keeping the end (useful for file paths) and
+/// marking the cut with a leading `…`.
 pub fn truncate_end(s: &str, max_chars: usize) -> String {
     if max_chars == 0 {
         return String::new();
@@ -179,8 +186,9 @@ pub fn capture_run_layout(area: Rect) -> [Rect; 5] {
         .direction(ratatui::layout::Direction::Horizontal)
         .constraints([
             Constraint::Percentage(34),
-            Constraint::Percentage(46),
-            Constraint::Percentage(20),
+            Constraint::Min(20),
+            // Fixed width so "Bitrate: 123.45 Mbps" fits on one line.
+            Constraint::Length(22),
         ])
         .split(chunks[0]);
     [top[0], top[1], top[2], chunks[1], chunks[2]]

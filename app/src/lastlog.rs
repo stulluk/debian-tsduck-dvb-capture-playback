@@ -28,13 +28,7 @@ pub fn init() {
         );
         let path = std::env::var("DVBHUB_LOG")
             .ok()
-            .filter(|s| {
-                !s.is_empty()
-                    && s != "0"
-                    && s != "1"
-                    && s != "true"
-                    && s != "false"
-            })
+            .filter(|s| !s.is_empty() && s != "0" && s != "1" && s != "true" && s != "false")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(DEFAULT_PATH));
 
@@ -65,10 +59,7 @@ pub fn init() {
                 path.display()
             ),
         );
-        write_raw(
-            &mut state,
-            &format!("argv: {}", args.join(" ")),
-        );
+        write_raw(&mut state, &format!("argv: {}", args.join(" ")));
         if !tmpfs {
             write_raw(
                 &mut state,
@@ -142,38 +133,29 @@ pub fn is_tmpfs_mount(path: &Path) -> bool {
     let Ok(target) = std::fs::canonicalize(path) else {
         return false;
     };
-    let target = target.to_string_lossy();
-    let mut best: Option<(&str, usize)> = None;
+    // The filesystem holding `target` is the one of the longest mount point that
+    // is a path-component prefix of it (any type, so nested mounts are honoured).
+    let mut best: Option<(usize, bool)> = None;
     for line in mounts.lines() {
         let mut parts = line.split_whitespace();
-        let Some(_dev) = parts.next() else {
+        let (Some(_dev), Some(mount_point), Some(fstype)) =
+            (parts.next(), parts.next(), parts.next())
+        else {
             continue;
         };
-        let Some(mount_point) = parts.next() else {
-            continue;
-        };
-        let Some(fstype) = parts.next() else {
-            continue;
-        };
-        if fstype != "tmpfs" {
-            continue;
-        }
-        let mp = mount_point.to_string();
-        if target.starts_with(&mp) {
-            let len = mp.len();
-            if best.map(|(_, l)| len > l).unwrap_or(true) {
-                best = Some((mount_point, len));
+        if target.starts_with(Path::new(mount_point)) {
+            let len = mount_point.len();
+            if best.map_or(true, |(l, _)| len >= l) {
+                best = Some((len, fstype == "tmpfs"));
             }
         }
     }
-    best.is_some()
+    best.is_some_and(|(_, tmpfs)| tmpfs)
 }
 
 /// Returns `fuser` output for a DVB frontend path (empty when free).
 pub fn frontend_holder(frontend: &Path) -> String {
-    let output = std::process::Command::new("fuser")
-        .arg(frontend)
-        .output();
+    let output = std::process::Command::new("fuser").arg(frontend).output();
     match output {
         Ok(o) if !o.stdout.is_empty() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
         Ok(o) if !o.stderr.is_empty() => String::from_utf8_lossy(&o.stderr).trim().to_string(),
@@ -198,10 +180,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tmp_is_usually_tmpfs() {
-        if Path::new("/tmp").is_dir() {
-            assert!(is_tmpfs_mount(Path::new("/tmp")));
+    fn tmpfs_detection_matches_proc_mounts() {
+        // Whether /tmp is tmpfs depends on the host (not in Docker, not on all
+        // distros), so check against the mount table instead of assuming it.
+        let mounts = std::fs::read_to_string("/proc/mounts").unwrap_or_default();
+        let tmpfs_mount = mounts.lines().find_map(|l| {
+            let f: Vec<&str> = l.split_whitespace().collect();
+            (f.len() > 2 && f[2] == "tmpfs" && Path::new(f[1]).is_dir()).then(|| f[1].to_string())
+        });
+        if let Some(mp) = tmpfs_mount {
+            assert!(
+                is_tmpfs_mount(Path::new(&mp)),
+                "{mp} is tmpfs in /proc/mounts"
+            );
         }
+        assert!(!is_tmpfs_mount(Path::new("/proc")));
     }
 
     #[test]

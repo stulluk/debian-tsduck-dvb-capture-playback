@@ -11,7 +11,7 @@ use crate::satellites::{Satellite, SatTransponder};
 use anyhow::Context;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::Sender;
-use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+use std::sync::{atomic::AtomicBool, Arc};
 
 /// Slug for satellite directory names (`Turksat 42E` → `turksat42e`).
 pub fn satellite_slug(name: &str) -> String {

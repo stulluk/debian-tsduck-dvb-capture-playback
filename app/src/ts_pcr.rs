@@ -130,14 +130,19 @@ mod tests {
         pkt[3] = 0x30; // adaptation + payload
         pkt[4] = 0x07; // adaptation length
         pkt[5] = 0x50; // PCR flag
-        // PCR base = 1 @ 90kHz → ext = 0 → 27MHz ticks = 300
+                       // PCR base is 33 bits: bytes 6..9 hold bits 32..1, the top bit of
+                       // byte 10 holds bit 0. Base = 1 @ 90 kHz, ext = 0 → 300 ticks @ 27 MHz.
         pkt[6] = 0x00;
         pkt[7] = 0x00;
         pkt[8] = 0x00;
         pkt[9] = 0x00;
-        pkt[10] = 0x00;
+        pkt[10] = 0x80;
         pkt[11] = 0x00;
         assert_eq!(pcr_from_packet(&pkt), Some(300));
+        // Base = 1, ext = 0x102 (9-bit extension spans byte 10 bit 0 + byte 11).
+        pkt[10] = 0x81;
+        pkt[11] = 0x02;
+        assert_eq!(pcr_from_packet(&pkt), Some(300 + 0x102));
     }
 
     #[test]
