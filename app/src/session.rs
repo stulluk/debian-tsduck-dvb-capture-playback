@@ -1,75 +1,90 @@
-//! Live DVB session management (tune, capture, signal monitoring).
+//! Web session manager: runs `tsp` jobs for the web UI and fans out progress.
 //!
-//! The web UI drives short-lived `tsp` child processes for tuning and
-//! recording. Tuning runs `tsp -I dvb … -P analyze --json -O drop` and parses
-//! lock/strength/SNR lines plus periodic analyze JSON for the service list.
-//! Capture reuses the same tuning parameters but writes to a file; stopping
-//! sends SIGTERM for a clean TS finalize.
+//! Two independent job slots:
+//!
+//! * **tuner** — one of monitor / capture / scan / play at a time (they all
+//!   need the tuner). Starting a new tuner job stops the current one.
+//! * **modulator** — DTU-315 playout. Runs alongside a tuner job, so a
+//!   DTU-315 → TBS5530 loopback (play out + capture) works from the browser.
+//!
+//! Capture and scan reuse the CLI/TUI engines (`sat_capture`, `terr_capture`,
+//! `cable_capture`, `channel_scan`), so file naming, `_services.json` sidecars
+//! and signal statistics are identical everywhere. Every event is pushed to
+//! WebSocket subscribers and appended to the log file.
 
-use anyhow::Context;
 use crate::analyze::ServiceInfo;
+use crate::cable::CableMux;
+use crate::channel_scan::{self, ScanEvent, ScanOptions, ScanTarget, TargetResult};
+use crate::channels::ChannelDb;
 use crate::config::{AppConfig, TsduckPaths};
 use crate::devices::DvbDevice;
 use crate::pipeline::{CaptureParams, PlayParams};
-use crate::satellites::SatTransponder;
-use crate::scan::{self, ScannedTransponder};
-use crate::transponders;
-use serde::{Deserialize, Serialize};
+use crate::progress::CaptureEvent;
+use crate::satellites::{SatTransponder, Satellite};
+use crate::signal::{parse_dvbstatus_line, parse_signal_line};
+use crate::terrestrial::TerrestrialMux;
+use anyhow::Context;
+use serde::Serialize;
 use std::process::Stdio;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::{broadcast, Mutex, RwLock};
 
-use crate::signal::parse_dvbstatus_line;
-use crate::signal::parse_signal_line;
 pub use crate::signal::SignalStatus;
 
+/// Progress of the running capture job.
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct CaptureProgress {
+    pub label: String,
+    /// 1-based index of the current target.
+    pub index: usize,
+    pub total: usize,
+    pub current: String,
+    pub remaining_s: Option<u32>,
+    pub files: Vec<String>,
+}
+
+/// Progress of the running scan job.
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct ScanProgress {
+    pub index: usize,
+    pub total: usize,
+    pub current: String,
+    pub locked: usize,
+    pub found: usize,
+}
+
+/// Live playback info.
 #[derive(Debug, Clone, Serialize)]
+pub struct PlayInfo {
+    pub hls_url: String,
+    pub service_id: u64,
+    pub channel_id: Option<u64>,
+    pub name: String,
+    pub ready: bool,
+    /// Seconds from start until the first HLS manifest appeared.
+    pub ready_after_s: Option<f64>,
+}
+
+/// Snapshot pushed to the UI on every change.
+#[derive(Debug, Clone, Serialize, Default)]
 pub struct SessionStatus {
-    pub tuning: bool,
+    pub monitoring: bool,
     pub capturing: bool,
-    pub sat_capturing: bool,
     pub scanning: bool,
     pub playing: bool,
     pub playout: bool,
     pub device: Option<String>,
-    pub transponder_id: Option<u32>,
     pub signal: SignalStatus,
     pub services: Vec<ServiceInfo>,
-    pub scan_results: Vec<ScannedTransponder>,
-    pub capture_output: Option<String>,
-    pub sat_progress: Option<String>,
+    pub capture: Option<CaptureProgress>,
+    pub scan: Option<ScanProgress>,
+    pub play: Option<PlayInfo>,
     pub playout_file: Option<String>,
-    pub play_hls_url: Option<String>,
-    pub play_service_id: Option<u64>,
     pub last_error: Option<String>,
-}
-
-impl Default for SessionStatus {
-    fn default() -> Self {
-        Self {
-            tuning: false,
-            capturing: false,
-            sat_capturing: false,
-            scanning: false,
-            playing: false,
-            playout: false,
-            device: None,
-            transponder_id: None,
-            signal: SignalStatus::default(),
-            services: Vec::new(),
-            scan_results: Vec::new(),
-            capture_output: None,
-            sat_progress: None,
-            playout_file: None,
-            play_hls_url: None,
-            play_service_id: None,
-            last_error: None,
-        }
-    }
 }
 
 /// Events pushed to WebSocket subscribers.
@@ -79,151 +94,92 @@ pub enum WsEvent {
     Status { status: SessionStatus },
     Signal { signal: SignalStatus },
     Services { services: Vec<ServiceInfo> },
-    ScanComplete { transponders: Vec<ScannedTransponder> },
-    PlayStarted { hls_url: String, service_id: u64 },
-    Devices {
-        devices: Vec<DvbDevice>,
-        warnings: Vec<String>,
-    },
+    Devices { devices: Vec<DvbDevice>, warnings: Vec<String> },
+    ScanTarget { total: usize, kept: usize, result: TargetResult },
+    ScanDone { locked: usize, total: usize, found: usize, added: usize, cancelled: bool },
+    CaptureDone { files: Vec<String>, ok: usize, failed: usize, cancelled: bool },
+    PlayReady { hls_url: String, service_id: u64 },
     Error { message: String },
     Log { line: String },
 }
 
-/// JSON body for `POST /api/session/tune` and capture start.
-#[derive(Debug, Deserialize)]
-pub struct TuneRequest {
-    pub device_name: Option<String>,
-    pub adapter: Option<u32>,
-    /// Reference transponder id (1-4); if set, manual tuning fields are ignored.
-    pub transponder_id: Option<u32>,
-    pub delivery_system: Option<String>,
-    pub frequency_mhz: Option<u32>,
-    pub polarity: Option<String>,
-    pub symbol_rate_ksps: Option<u32>,
-    pub modulation: Option<String>,
-    pub fec: Option<String>,
-    pub satellite_number: Option<u32>,
-    pub signal_timeout_s: Option<u32>,
+/// A resolved capture job.
+pub enum CaptureJob {
+    /// One or more TPs of a satellite (catalogue entry or manual definition).
+    Satellite { satellite: Satellite, device: String, seconds: u32 },
+    Terrestrial { mux: TerrestrialMux, device: String, seconds: u32 },
+    Cable { mux: CableMux, device: String, seconds: u32 },
 }
 
-#[derive(Debug, Deserialize)]
-pub struct CaptureStartRequest {
-    pub tune: TuneRequest,
-    pub output: String,
-    pub seconds: Option<u32>,
+/// A resolved channel scan job.
+pub struct ScanJob {
+    pub device: String,
+    pub targets: Vec<ScanTarget>,
+    pub opts: ScanOptions,
+    pub save: bool,
+    pub replace: bool,
 }
 
-#[derive(Debug, Deserialize)]
-pub struct PlayStartRequest {
-    pub tune: TuneRequest,
+/// A resolved playback (watch) job.
+pub struct PlayJob {
+    pub params: CaptureParams,
     pub service_id: u64,
+    pub channel_id: Option<u64>,
+    pub name: String,
 }
 
-/// A resolved plan to capture every transponder of a satellite sequentially.
-pub struct SatCapturePlan {
-    pub device_name: Option<String>,
-    pub adapter: Option<u32>,
-    pub satellite_name: String,
-    pub diseqc: u32,
-    pub lnb: Option<String>,
-    pub seconds: u32,
-    pub signal_timeout_s: u32,
-    pub transponders: Vec<SatTransponder>,
+struct Job {
+    id: u64,
+    kind: &'static str,
+    cancel: Arc<AtomicBool>,
+    child: Option<Child>,
+    task: Option<tokio::task::JoinHandle<()>>,
 }
 
-/// JSON body for `POST /api/session/playout` (DTU-315 file -> modulator).
-#[derive(Debug, Deserialize)]
-pub struct PlayoutRequest {
-    pub file: String,
-    pub frequency_mhz: u32,
-    pub modulation: String,
-    pub symbol_rate_ksps: u32,
-    pub code_rate: String,
-    #[serde(default)]
-    pub level: Option<i32>,
-    #[serde(default)]
-    pub infinite: bool,
+#[derive(Default)]
+struct Inner {
+    tuner: Option<Job>,
+    modulator: Option<Job>,
 }
 
-/// Shared session manager (one tune + one capture child at a time).
+/// Shared session manager.
 pub struct SessionManager {
     paths: Arc<TsduckPaths>,
     config: Arc<RwLock<AppConfig>>,
+    channels: Arc<RwLock<ChannelDb>>,
     inner: Mutex<Inner>,
     status: RwLock<SessionStatus>,
     bus: broadcast::Sender<WsEvent>,
-}
-
-struct Inner {
-    tune_child: Option<Child>,
-    capture_child: Option<Child>,
-    scan_child: Option<Child>,
-    play_child: Option<Child>,
-    playout_child: Option<Child>,
-    tune_log_task: Option<tokio::task::JoinHandle<()>>,
-    scan_log_task: Option<tokio::task::JoinHandle<()>>,
-    capture_log_task: Option<tokio::task::JoinHandle<()>>,
-    play_log_task: Option<tokio::task::JoinHandle<()>>,
-    playout_log_task: Option<tokio::task::JoinHandle<()>>,
-    sat_capture_task: Option<tokio::task::JoinHandle<()>>,
-    sat_cancel: Arc<AtomicBool>,
-    /// Incremented on each `start_play`; stale HLS watch tasks exit when mismatched.
-    play_generation: u64,
-    play_hls_watch: Option<tokio::task::JoinHandle<()>>,
+    next_id: AtomicU64,
 }
 
 impl SessionManager {
-    /// Creates a new manager and returns it together with a broadcast receiver
-    /// for WebSocket fan-out.
+    /// Creates the manager; also starts the file logger.
     pub fn new(
         paths: Arc<TsduckPaths>,
         config: Arc<RwLock<AppConfig>>,
-    ) -> (Arc<Self>, broadcast::Receiver<WsEvent>) {
-        let (tx, rx) = broadcast::channel(256);
-        // Persist every log/error/action event to a file for later analysis.
-        let file_log_rx = tx.subscribe();
-        tokio::spawn(file_logger(file_log_rx, crate::config::log_file_path()));
-        let mgr = Arc::new(Self {
+        channels: Arc<RwLock<ChannelDb>>,
+    ) -> Arc<Self> {
+        let (tx, _) = broadcast::channel(1024);
+        tokio::spawn(file_logger(tx.subscribe(), crate::config::log_file_path()));
+        Arc::new(Self {
             paths,
             config,
-            inner: Mutex::new(Inner {
-                tune_child: None,
-                capture_child: None,
-                scan_child: None,
-                play_child: None,
-                playout_child: None,
-                tune_log_task: None,
-                scan_log_task: None,
-                capture_log_task: None,
-                play_log_task: None,
-                playout_log_task: None,
-                sat_capture_task: None,
-                sat_cancel: Arc::new(AtomicBool::new(false)),
-                play_generation: 0,
-                play_hls_watch: None,
-            }),
+            channels,
+            inner: Mutex::new(Inner::default()),
             status: RwLock::new(SessionStatus::default()),
             bus: tx,
-        });
-        (mgr, rx)
+            next_id: AtomicU64::new(1),
+        })
     }
 
-    /// Emits a high-level user-action marker to the log stream and file.
-    /// These lines start with `>>>` so they stand out from tool output.
-    fn action(&self, msg: impl Into<String>) {
-        let _ = self.bus.send(WsEvent::Log {
-            line: format!(">>> {}", msg.into()),
-        });
-    }
-
-    /// Returns a clone of the broadcast sender (for additional WS clients).
+    /// New receiver for a WebSocket client.
     pub fn subscribe(&self) -> broadcast::Receiver<WsEvent> {
         self.bus.subscribe()
     }
 
-    /// Returns a clone of the broadcast sender (for non-async producers like
-    /// the device monitor thread).
-    pub fn subscribe_sender(&self) -> broadcast::Sender<WsEvent> {
+    /// Sender for non-async producers (device monitor thread).
+    pub fn sender(&self) -> broadcast::Sender<WsEvent> {
         self.bus.clone()
     }
 
@@ -231,13 +187,39 @@ impl SessionManager {
         self.status.read().await.clone()
     }
 
-    /// Returns a snapshot of the current application config.
-    #[allow(dead_code)]
-    pub async fn config(&self) -> AppConfig {
-        self.config.read().await.clone()
+    /// Logs a user-action marker (`>>> …`).
+    fn action(&self, msg: impl Into<String>) {
+        let line = format!(">>> {}", msg.into());
+        crate::lastlog::event("web", &line);
+        let _ = self.bus.send(WsEvent::Log { line });
     }
 
-    /// Updates the capture directory, persists the config, and creates the dir.
+    async fn set_status(&self, f: impl FnOnce(&mut SessionStatus)) {
+        let st = {
+            let mut st = self.status.write().await;
+            f(&mut st);
+            st.clone()
+        };
+        let _ = self.bus.send(WsEvent::Status { status: st });
+    }
+
+    async fn push_signal(&self, signal: SignalStatus) {
+        self.status.write().await.signal = signal.clone();
+        let _ = self.bus.send(WsEvent::Signal { signal });
+    }
+
+    async fn push_services(&self, services: Vec<ServiceInfo>) {
+        self.status.write().await.services = services.clone();
+        let _ = self.bus.send(WsEvent::Services { services });
+    }
+
+    async fn error(&self, message: String) {
+        crate::lastlog::event("web.error", &message);
+        let _ = self.bus.send(WsEvent::Error { message: message.clone() });
+        self.set_status(|st| st.last_error = Some(message)).await;
+    }
+
+    /// Updates the capture directory, persists the config and creates the dir.
     pub async fn set_capture_dir(&self, dir: std::path::PathBuf) -> anyhow::Result<AppConfig> {
         tokio::fs::create_dir_all(&dir)
             .await
@@ -251,624 +233,47 @@ impl SessionManager {
         tokio::task::spawn_blocking(move || to_save.save())
             .await
             .map_err(|e| anyhow::anyhow!("config save task failed: {e}"))?
-            .with_context(|| "failed to persist config")?;
-        self.action(format!("SETTINGS: capture_dir = {}", cfg.capture_dir.display()));
+            .context("failed to persist config")?;
+        self.action(format!("SETTINGS capture_dir = {}", cfg.capture_dir.display()));
         Ok(cfg)
     }
 
-    async fn set_status<F>(&self, f: F)
-    where
-        F: FnOnce(&mut SessionStatus),
-    {
-        {
-            let mut st = self.status.write().await;
-            f(&mut st);
+    // ---- job slots -----------------------------------------------------
+
+    fn new_job(&self, kind: &'static str) -> Job {
+        Job {
+            id: self.next_id.fetch_add(1, Ordering::SeqCst),
+            kind,
+            cancel: Arc::new(AtomicBool::new(false)),
+            child: None,
+            task: None,
         }
-        let st = self.status.read().await.clone();
-        let _ = self.bus.send(WsEvent::Status { status: st });
     }
 
-    async fn push_signal(&self, signal: SignalStatus) {
-        {
-            let mut st = self.status.write().await;
-            st.signal = signal.clone();
+    /// Stops the current tuner job (monitor / capture / scan / play).
+    pub async fn stop_tuner(&self) {
+        let job = self.inner.lock().await.tuner.take();
+        if let Some(job) = job {
+            self.action(format!("{} stop", job.kind.to_uppercase()));
+            stop_job(job).await;
         }
-        let _ = self.bus.send(WsEvent::Signal { signal });
-    }
-
-    async fn push_services(&self, services: Vec<ServiceInfo>) {
-        {
-            let mut st = self.status.write().await;
-            st.services = services.clone();
-        }
-        let _ = self.bus.send(WsEvent::Services { services });
-    }
-
-    fn emit_error(self: &Arc<Self>, message: String) {
-        let _ = self.bus.send(WsEvent::Error {
-            message: message.clone(),
-        });
-        let mgr = Arc::clone(self);
-        tokio::spawn(async move {
-            mgr.set_status(|st| st.last_error = Some(message)).await;
-        });
-    }
-
-    /// Builds `CaptureParams` from a tune request (transponder or manual).
-    pub fn capture_params_from_request(
-        req: &TuneRequest,
-        seconds: u32,
-        output: String,
-    ) -> anyhow::Result<CaptureParams> {
-        if let Some(id) = req.transponder_id {
-            let tp = transponders::by_id(id)
-                .ok_or_else(|| anyhow::anyhow!("unknown transponder id {id}"))?;
-            let mut p = CaptureParams::from_transponder(
-                tp,
-                req.device_name.clone(),
-                req.adapter,
-                seconds,
-                output,
-            );
-            p.signal_timeout_s = req.signal_timeout_s.unwrap_or(15);
-            p.satellite_number = req.satellite_number;
-            return Ok(p);
-        }
-        let frequency_mhz = req
-            .frequency_mhz
-            .ok_or_else(|| anyhow::anyhow!("frequency_mhz required without transponder_id"))?;
-        let delivery_system = req
-            .delivery_system
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("delivery_system required without transponder_id"))?;
-        Ok(CaptureParams {
-            device_name: req.device_name.clone(),
-            adapter: req.adapter,
-            delivery_system,
-            frequency_hz: frequency_mhz as u64 * 1_000_000,
-            polarity: req.polarity.clone(),
-            symbol_rate: req.symbol_rate_ksps.map(|s| s as u64 * 1_000),
-            modulation: req.modulation.clone(),
-            fec: req.fec.clone(),
-            lnb: None,
-            satellite_number: req.satellite_number,
-            bandwidth_hz: None,
-            guard_interval: None,
-            plp: None,
-            dvb_status_interval_s: None,
-            signal_timeout_s: req.signal_timeout_s.unwrap_or(15),
-            seconds,
-            output,
-            live_analyze: false,
-        })
-    }
-
-    /// Starts a monitor-only tune (no file output).
-    pub async fn start_tune(self: &Arc<Self>, req: TuneRequest) -> anyhow::Result<()> {
-        self.stop_all().await;
-
-        let params = Self::capture_params_from_request(&req, 0, "/dev/null".into())?;
-        let mut args = params.to_tsp_args();
-        // Replace file output with analyze + drop for live PSI/SI.
-        if let Some(i) = args.iter().position(|a| a == "-O") {
-            args.truncate(i);
-        }
-        args.extend([
-            "-P".into(),
-            "analyze".into(),
-            "--json".into(),
-            "--interval".into(),
-            "3".into(),
-            "-O".into(),
-            "drop".into(),
-        ]);
-
-        let device = req
-            .device_name
-            .clone()
-            .or_else(|| req.adapter.map(|a| format!("/dev/dvb/adapter{a}")))
-            .unwrap_or_else(|| "default".into());
-
-        self.action(format!(
-            "TUNE start: device={device} transponder={}",
-            req.transponder_id
-                .map(|i| i.to_string())
-                .unwrap_or_else(|| "manual".into())
-        ));
-
-        let mut child = spawn_tsp(&self.paths, &args).await?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| anyhow::anyhow!("tsp tune: no stdout"))?;
-        let stderr = child
-            .stderr
-            .take()
-            .ok_or_else(|| anyhow::anyhow!("tsp tune: no stderr"))?;
-
-        let mgr = Arc::clone(self);
-        let log_task = tokio::spawn(async move {
-            read_tune_output(mgr, stdout, stderr).await;
-        });
-
-        {
-            let mut inner = self.inner.lock().await;
-            inner.tune_child = Some(child);
-            inner.tune_log_task = Some(log_task);
-        }
-
         self.set_status(|st| {
-            st.tuning = true;
+            st.monitoring = false;
             st.capturing = false;
-            st.device = Some(device);
-            st.transponder_id = req.transponder_id;
-            st.signal = SignalStatus::default();
-            st.services.clear();
-            st.capture_output = None;
-            st.last_error = None;
+            st.scanning = false;
+            st.playing = false;
+            st.play = None;
         })
         .await;
-
-        Ok(())
+        clean_hls_tree(&hls_root()).await;
     }
 
-    /// Stops the monitor tune child (SIGTERM).
-    pub async fn stop_tune(&self) {
-        let (child, task) = {
-            let mut inner = self.inner.lock().await;
-            (inner.tune_child.take(), inner.tune_log_task.take())
-        };
-        if let Some(mut c) = child {
-            self.action("TUNE stop");
-            graceful_stop(&mut c).await;
-        }
-        if let Some(t) = task {
-            let _ = t.await;
-        }
-        self.set_status(|st| {
-            st.tuning = false;
-        })
-        .await;
-    }
-
-    /// Starts a file capture (stops any existing tune/capture first).
-    pub async fn start_capture(self: &Arc<Self>, req: CaptureStartRequest) -> anyhow::Result<()> {
-        self.stop_all().await;
-
-        let seconds = req.seconds.unwrap_or(0);
-        let resolved = self.config.read().await.resolve_output(&req.output);
-        if let Some(parent) = resolved.parent() {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .with_context(|| format!("cannot create output dir {}", parent.display()))?;
-        }
-        let output = resolved.to_string_lossy().into_owned();
-        let params = Self::capture_params_from_request(&req.tune, seconds, output.clone())?;
-        let args = params.to_tsp_args();
-        let device = req
-            .tune
-            .device_name
-            .clone()
-            .or_else(|| req.tune.adapter.map(|a| format!("/dev/dvb/adapter{a}")))
-            .unwrap_or_else(|| "default".into());
-
-        self.action(format!(
-            "CAPTURE start: device={device} -> {output} ({})",
-            if seconds > 0 {
-                format!("{seconds}s")
-            } else {
-                "until stop".into()
-            }
-        ));
-
-        let mut child = spawn_tsp(&self.paths, &args).await?;
-        let log_task = take_child_logger(self, &mut child);
-        {
-            let mut inner = self.inner.lock().await;
-            inner.capture_child = Some(child);
-            inner.capture_log_task = log_task;
-        }
-
-        self.set_status(|st| {
-            st.tuning = false;
-            st.capturing = true;
-            st.device = Some(device);
-            st.transponder_id = req.tune.transponder_id;
-            st.capture_output = Some(output);
-            st.last_error = None;
-        })
-        .await;
-
-        // When tsp exits on its own (--until --seconds N), reap the child and
-        // notify the UI; manual stop_capture() takes the child first.
-        let mgr = Arc::clone(self);
-        tokio::spawn(async move {
-            mgr.watch_capture_child().await;
-        });
-
-        Ok(())
-    }
-
-    /// Polls until the capture child exits, then finalizes like stop_capture.
-    async fn watch_capture_child(self: &Arc<Self>) {
-        loop {
-            tokio::time::sleep(Duration::from_millis(400)).await;
-            let exited = {
-                let mut inner = self.inner.lock().await;
-                match inner.capture_child.as_mut() {
-                    Some(c) => matches!(c.try_wait(), Ok(Some(_))),
-                    None => return,
-                }
-            };
-            if exited {
-                self.complete_capture("CAPTURE complete").await;
-                return;
-            }
-        }
-    }
-
-    /// Reaps an already-exited capture child (timed capture finished).
-    async fn complete_capture(self: &Arc<Self>, label: &str) {
-        let (child, task) = {
-            let mut inner = self.inner.lock().await;
-            (inner.capture_child.take(), inner.capture_log_task.take())
-        };
-        if child.is_none() {
-            return;
-        }
-        if let Some(mut c) = child {
-            let _ = c.wait().await;
-        }
-        if let Some(t) = task {
-            let _ = t.await;
-        }
-        self.finalize_capture(label).await;
-    }
-
-    /// Stops capture (SIGTERM) and optionally analyzes the output file.
-    pub async fn stop_capture(self: &Arc<Self>) -> Option<String> {
-        let (child, task) = {
-            let mut inner = self.inner.lock().await;
-            (inner.capture_child.take(), inner.capture_log_task.take())
-        };
-        let had_child = child.is_some();
-        if let Some(mut c) = child {
-            self.action("CAPTURE stop");
-            graceful_stop(&mut c).await;
-        }
-        if let Some(t) = task {
-            let _ = t.await;
-        }
-        let capturing = self.status.read().await.capturing;
-        if had_child || capturing {
-            self.finalize_capture("CAPTURE saved").await
-        } else {
-            self.status.read().await.capture_output.clone()
-        }
-    }
-
-    /// Clears capturing flag, logs completion, and kicks off post-capture analyze.
-    async fn finalize_capture(self: &Arc<Self>, label: &str) -> Option<String> {
-        let output = {
-            let st = self.status.read().await;
-            st.capture_output.clone()
-        };
-        self.set_status(|st| {
-            st.capturing = false;
-        })
-        .await;
-
-        if let Some(ref path) = output {
-            self.action(format!("{label}: {path} (analyzing…)"));
-            let paths = self.paths.clone();
-            let path = path.clone();
-            let mgr = Arc::clone(self);
-            tokio::spawn(async move {
-                let services = match tokio::task::spawn_blocking(move || {
-                    crate::analyze::analyze_file(&paths, &path).map(|s| s.services)
-                })
-                .await
-                {
-                    Ok(Ok(svcs)) => svcs,
-                    Ok(Err(e)) => {
-                        mgr.emit_error(format!("post-capture analyze failed: {e}"));
-                        Vec::new()
-                    }
-                    Err(e) => {
-                        mgr.emit_error(format!("analyze task failed: {e}"));
-                        Vec::new()
-                    }
-                };
-                if !services.is_empty() {
-                    mgr.push_services(services).await;
-                }
-            });
-        }
-
-        output
-    }
-
-    /// Stops tune, capture, scan, play, sat-capture, and playout children.
-    pub async fn stop_all(self: &Arc<Self>) {
-        self.stop_sat_capture().await;
-        self.stop_tune().await;
-        self.stop_capture().await;
-        self.stop_scan().await;
-        self.stop_play().await;
-        self.stop_playout().await;
-    }
-
-    /// Captures every transponder of a satellite sequentially to its own file.
-    ///
-    /// Runs as a background task; each transponder is tuned and recorded for
-    /// `plan.seconds`. Progress is streamed to the log and reflected in status.
-    /// Files are written under `<capture_dir>/<satellite>/`.
-    pub async fn start_sat_capture(self: &Arc<Self>, plan: SatCapturePlan) -> anyhow::Result<()> {
-        self.stop_all().await;
-        if plan.transponders.is_empty() {
-            anyhow::bail!("satellite has no transponders to capture");
-        }
-
-        let capture_dir = self.config.read().await.capture_dir.clone();
-        let safe_name: String = plan
-            .satellite_name
-            .chars()
-            .map(|c| if c.is_alphanumeric() { c } else { '_' })
-            .collect();
-        let out_dir = capture_dir.join(&safe_name);
-        tokio::fs::create_dir_all(&out_dir)
-            .await
-            .with_context(|| format!("cannot create capture dir {}", out_dir.display()))?;
-
-        let device = plan
-            .device_name
-            .clone()
-            .or_else(|| plan.adapter.map(|a| format!("/dev/dvb/adapter{a}")))
-            .unwrap_or_else(|| "default".into());
-
-        let cancel = Arc::new(AtomicBool::new(false));
-        {
-            let mut inner = self.inner.lock().await;
-            inner.sat_cancel = cancel.clone();
-        }
-
-        let total = plan.transponders.len();
-        self.action(format!(
-            "SAT capture start: {} ({total} TPs, {}s each) -> {}",
-            plan.satellite_name,
-            plan.seconds,
-            out_dir.display()
-        ));
-        self.set_status(|st| {
-            st.tuning = false;
-            st.capturing = false;
-            st.sat_capturing = true;
-            st.device = Some(device.clone());
-            st.sat_progress = Some(format!("0/{total}"));
-            st.last_error = None;
-        })
-        .await;
-
-        let mgr = Arc::clone(self);
-        let task = tokio::spawn(async move {
-            mgr.run_sat_capture(plan, out_dir, total, cancel).await;
-        });
-        {
-            let mut inner = self.inner.lock().await;
-            inner.sat_capture_task = Some(task);
-        }
-        Ok(())
-    }
-
-    /// Body of the sequential satellite-capture task.
-    async fn run_sat_capture(
-        self: Arc<Self>,
-        plan: SatCapturePlan,
-        out_dir: std::path::PathBuf,
-        total: usize,
-        cancel: Arc<AtomicBool>,
-    ) {
-        // Slug for file names, matching the TP-capture convention
-        // (`<satname>_<freq><pol><sr>_<timestamp>.ts`).
-        let sat_slug: String = plan
-            .satellite_name
-            .to_lowercase()
-            .chars()
-            .filter(|c| c.is_ascii_alphanumeric())
-            .collect();
-        let sat_slug = if sat_slug.is_empty() {
-            "sat".to_string()
-        } else {
-            sat_slug
-        };
-
-        let mut done = 0usize;
-        for (idx, tp) in plan.transponders.iter().enumerate() {
-            if cancel.load(Ordering::Relaxed) {
-                break;
-            }
-            let pol = tp.polarity.chars().next().unwrap_or('x').to_ascii_uppercase();
-            let pol_lc = pol.to_ascii_lowercase();
-            let stamp = chrono::Local::now().format("%Y%m%d%H%M%S");
-            let file = out_dir.join(format!(
-                "{}_{}{}{}_{}.ts",
-                sat_slug, tp.frequency_mhz, pol_lc, tp.symbol_rate_ksps, stamp
-            ));
-            let params = CaptureParams {
-                device_name: plan.device_name.clone(),
-                adapter: plan.adapter,
-                delivery_system: tp.delivery_system.clone(),
-                frequency_hz: tp.frequency_mhz as u64 * 1_000_000,
-                polarity: Some(tp.polarity.clone()),
-                symbol_rate: Some(tp.symbol_rate_ksps as u64 * 1_000),
-                modulation: Some(tp.modulation.clone()),
-                fec: Some(tp.fec.clone()),
-                lnb: plan.lnb.clone(),
-                satellite_number: Some(plan.diseqc),
-                bandwidth_hz: None,
-                guard_interval: None,
-                plp: None,
-                dvb_status_interval_s: None,
-                signal_timeout_s: plan.signal_timeout_s,
-                seconds: plan.seconds,
-                output: file.to_string_lossy().into_owned(),
-                live_analyze: false,
-            };
-            let progress = format!("{}/{}", idx + 1, total);
-            self.set_status(|st| st.sat_progress = Some(progress.clone())).await;
-            self.action(format!(
-                "SAT capture {}/{}: {} MHz {} {} -> {}",
-                idx + 1,
-                total,
-                tp.frequency_mhz,
-                pol,
-                tp.delivery_system,
-                file.display()
-            ));
-
-            let args = params.to_tsp_args();
-            let mut child = match spawn_tsp(&self.paths, &args).await {
-                Ok(c) => c,
-                Err(e) => {
-                    self.emit_error(format!("SAT capture spawn failed: {e}"));
-                    continue;
-                }
-            };
-            let log_task = take_child_logger(&self, &mut child);
-            {
-                let mut inner = self.inner.lock().await;
-                inner.capture_child = Some(child);
-                inner.capture_log_task = log_task;
-            }
-
-            // Wait for this transponder's capture to finish (or be cancelled).
-            loop {
-                if cancel.load(Ordering::Relaxed) {
-                    self.stop_capture().await;
-                    break;
-                }
-                let finished = {
-                    let mut inner = self.inner.lock().await;
-                    match inner.capture_child.as_mut() {
-                        Some(c) => matches!(c.try_wait(), Ok(Some(_))),
-                        None => true,
-                    }
-                };
-                if finished {
-                    self.stop_capture().await;
-                    done += 1;
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(400)).await;
-            }
-        }
-
-        let cancelled = cancel.load(Ordering::Relaxed);
-        self.action(format!(
-            "SAT capture {}: {done}/{total} transponders recorded",
-            if cancelled { "stopped" } else { "complete" }
-        ));
-        self.set_status(|st| {
-            st.sat_capturing = false;
-            st.sat_progress = None;
-        })
-        .await;
-    }
-
-    /// Stops an in-progress satellite capture (cancels the loop + current TP).
-    pub async fn stop_sat_capture(self: &Arc<Self>) {
-        let (task, cancel) = {
-            let inner = self.inner.lock().await;
-            (
-                inner.sat_capture_task.is_some(),
-                inner.sat_cancel.clone(),
-            )
-        };
-        if !task {
-            return;
-        }
-        cancel.store(true, Ordering::Relaxed);
-        // Kill the in-flight per-TP capture so the loop advances immediately.
-        let child = {
-            let mut inner = self.inner.lock().await;
-            inner.capture_child.take()
-        };
-        if let Some(mut c) = child {
-            graceful_stop(&mut c).await;
-        }
-        let handle = {
-            let mut inner = self.inner.lock().await;
-            inner.sat_capture_task.take()
-        };
-        if let Some(h) = handle {
-            let _ = h.await;
-        }
-        self.set_status(|st| {
-            st.sat_capturing = false;
-            st.sat_progress = None;
-        })
-        .await;
-    }
-
-    /// Starts a DTU-315 playout of a transport-stream file.
-    pub async fn start_playout(self: &Arc<Self>, req: PlayoutRequest) -> anyhow::Result<()> {
-        self.stop_all().await;
-
-        let resolved = self.config.read().await.resolve_output(&req.file);
-        if !resolved.is_file() {
-            anyhow::bail!("playout file not found: {}", resolved.display());
-        }
-        let file = resolved.to_string_lossy().into_owned();
-        let params = PlayParams {
-            input: file.clone(),
-            infinite: req.infinite,
-            delivery: crate::pipeline::PlayoutDelivery::Satellite,
-            frequency_hz: req.frequency_mhz as u64 * 1_000_000,
-            modulation: req.modulation.clone(),
-            symbol_rate: Some(req.symbol_rate_ksps as u64 * 1_000),
-            code_rate: Some(req.code_rate.clone()),
-            bandwidth_hz: None,
-            guard_interval: None,
-            plp_modulation: None,
-            j83: None,
-            level_dbm_tenths: req.level,
-            instant_detach: !req.infinite,
-        };
-        let args = params.to_tsp_args();
-
-        self.action(format!(
-            "PLAYOUT start: {} @ {} MHz {} {}kS/s {}",
-            file, req.frequency_mhz, req.modulation, req.symbol_rate_ksps, req.code_rate
-        ));
-
-        let mut child = spawn_tsp(&self.paths, &args).await?;
-        let log_task = take_child_logger(self, &mut child);
-        {
-            let mut inner = self.inner.lock().await;
-            inner.playout_child = Some(child);
-            inner.playout_log_task = log_task;
-        }
-        self.set_status(|st| {
-            st.playout = true;
-            st.playout_file = Some(file);
-            st.last_error = None;
-        })
-        .await;
-        Ok(())
-    }
-
-    /// Stops a DTU-315 playout.
+    /// Stops the DTU-315 playout.
     pub async fn stop_playout(&self) {
-        let (child, task) = {
-            let mut inner = self.inner.lock().await;
-            (inner.playout_child.take(), inner.playout_log_task.take())
-        };
-        if let Some(mut c) = child {
+        let job = self.inner.lock().await.modulator.take();
+        if let Some(job) = job {
             self.action("PLAYOUT stop");
-            graceful_stop(&mut c).await;
-        }
-        if let Some(t) = task {
-            let _ = t.await;
+            stop_job(job).await;
         }
         self.set_status(|st| {
             st.playout = false;
@@ -877,309 +282,610 @@ impl SessionManager {
         .await;
     }
 
-    /// Runs `tsscan --nit-scan` on the tuned transponder and parses NIT entries.
-    pub async fn start_nit_scan(self: &Arc<Self>, req: TuneRequest) -> anyhow::Result<()> {
-        self.stop_all().await;
-
-        let params = Self::capture_params_from_request(&req, 0, String::new())?;
-        let args = tsscan_args_from_params(&params);
-        let device = req
-            .device_name
-            .clone()
-            .or_else(|| req.adapter.map(|a| format!("/dev/dvb/adapter{a}")))
-            .unwrap_or_else(|| "default".into());
-
-        self.action(format!("NIT scan start: device={device}"));
-
-        let mut child = spawn_tsscan(&self.paths, &args).await?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| anyhow::anyhow!("tsscan: no stdout"))?;
-        let stderr = child
-            .stderr
-            .take()
-            .ok_or_else(|| anyhow::anyhow!("tsscan: no stderr"))?;
-
-        {
-            let mut inner = self.inner.lock().await;
-            inner.scan_child = Some(child);
+    /// Clears the tuner slot if `id` is still the active job (natural end).
+    async fn finish_tuner_job(&self, id: u64) -> bool {
+        let mut inner = self.inner.lock().await;
+        if inner.tuner.as_ref().is_some_and(|j| j.id == id) {
+            inner.tuner = None;
+            true
+        } else {
+            false
         }
-
-        self.set_status(|st| {
-            st.tuning = false;
-            st.capturing = false;
-            st.playing = false;
-            st.scanning = true;
-            st.device = Some(device);
-            st.transponder_id = req.transponder_id;
-            st.scan_results.clear();
-            st.last_error = None;
-        })
-        .await;
-
-        let mgr = Arc::clone(self);
-        let task = tokio::spawn(async move {
-            let output = read_process_output(mgr.clone(), stdout, stderr).await;
-            let mut child = mgr.inner.lock().await.scan_child.take();
-            if let Some(ref mut c) = child {
-                if let Ok(status) = c.wait().await {
-                    if !status.success() {
-                        mgr.emit_error(format!("tsscan exited with {status}"));
-                    }
-                }
-            }
-            let results = scan::parse_tsscan_output(&output);
-            mgr.set_status(|st| {
-                st.scanning = false;
-                st.scan_results = results.clone();
-            })
-            .await;
-            let _ = mgr.bus.send(WsEvent::ScanComplete {
-                transponders: results,
-            });
-        });
-
-        {
-            let mut inner = self.inner.lock().await;
-            inner.scan_log_task = Some(task);
-        }
-
-        Ok(())
     }
 
-    /// Stops an in-progress NIT scan.
-    pub async fn stop_scan(&self) {
-        let (child, task) = {
-            let mut inner = self.inner.lock().await;
-            (inner.scan_child.take(), inner.scan_log_task.take())
-        };
-        if let Some(mut c) = child {
-            self.action("NIT scan stop");
-            graceful_stop(&mut c).await;
-        }
-        if let Some(t) = task {
-            let _ = t.await;
-        }
-        self.set_status(|st| {
-            st.scanning = false;
-        })
-        .await;
-    }
+    // ---- monitor -------------------------------------------------------
 
-    /// Starts live FTA playback via `zap` + ffmpeg HLS fork.
-    pub async fn start_play(self: &Arc<Self>, req: PlayStartRequest) -> anyhow::Result<String> {
-        self.stop_all().await;
-
-        let hls_root = self.config.read().await.hls_dir();
-        // Each service gets its own subdirectory so channel switches never reuse
-        // a stale manifest/segments from the previous zap target.
-        let hls_dir = hls_root.join(format!("s{}", req.service_id));
-        tokio::fs::create_dir_all(&hls_dir)
-            .await
-            .with_context(|| format!("cannot create HLS dir {}", hls_dir.display()))?;
-        clean_hls_dir(&hls_dir).await;
-        let m3u8_path = hls_dir.join("stream.m3u8");
-        let m3u8_str = m3u8_path.to_string_lossy().into_owned();
-
-        let params = Self::capture_params_from_request(&req.tune, 0, String::new())?;
+    /// Tunes and shows live signal + services (`tsp … -P analyze --interval 3 -O drop`).
+    pub async fn start_monitor(self: &Arc<Self>, params: CaptureParams) -> anyhow::Result<()> {
+        self.stop_tuner().await;
         let mut args = params.to_tsp_args();
         if let Some(i) = args.iter().position(|a| a == "-O") {
             args.truncate(i);
         }
-        // Reduce the TS to the chosen service, then hand it to ffmpeg which
-        // remuxes to HLS. Video is copied (H.264); audio is transcoded to AAC
-        // because MPEG-1/2 audio is not playable via HLS in most browsers.
-        // Only the video+audio elementary streams are mapped (SCTE-35, DVB
-        // subtitles and data PIDs would break the HLS muxer).
-        // Latency tuning: keep the input probe short and segments small so the
-        // first playable keyframe/manifest appears quickly (the player joins the
-        // live edge after a couple of 1 s segments).
-        let ffmpeg = format!(
-            "ffmpeg -hide_banner -loglevel error -fflags +genpts+discardcorrupt+nobuffer -flags low_delay -analyzeduration 1M -probesize 1M -i pipe:0 -map 0:v:0 -map 0:a:0? -c:v copy -c:a aac -b:a 128k -ac 2 -f hls -hls_time 1 -hls_list_size 6 -hls_flags delete_segments+append_list+omit_endlist -hls_segment_type mpegts {m3u8_str}"
+        args.extend(
+            ["-P", "analyze", "--json", "--interval", "3", "-O", "drop"]
+                .iter()
+                .map(|s| s.to_string()),
         );
-        args.extend([
-            "-P".into(),
-            "zap".into(),
-            req.service_id.to_string(),
-            "-O".into(),
-            "fork".into(),
-            ffmpeg,
-        ]);
-
-        let device = req
-            .tune
-            .device_name
-            .clone()
-            .or_else(|| req.tune.adapter.map(|a| format!("/dev/dvb/adapter{a}")))
-            .unwrap_or_else(|| "default".into());
-        let hls_url = format!("/hls/s{}/stream.m3u8", req.service_id);
-
+        let device = params.device_name.clone().unwrap_or_default();
         self.action(format!(
-            "PLAY start: device={device} service={}",
-            req.service_id
+            "MONITOR start {device} {} MHz",
+            params.frequency_hz / 1_000_000
         ));
-
-        let mut child = spawn_tsp(&self.paths, &args).await?;
-        let log_task = take_child_logger(self, &mut child);
-        {
-            let mut inner = self.inner.lock().await;
-            inner.play_child = Some(child);
-            inner.play_log_task = log_task;
-        }
-
+        let mut child = spawn_tsp(&self.paths, &args)?;
+        let (out, err) = (child.stdout.take(), child.stderr.take());
+        let mgr = Arc::clone(self);
+        let mut job = self.new_job("monitor");
+        job.task = Some(tokio::spawn(async move {
+            if let (Some(o), Some(e)) = (out, err) {
+                read_monitor_output(mgr, o, e).await;
+            }
+        }));
+        job.child = Some(child);
+        self.inner.lock().await.tuner = Some(job);
         self.set_status(|st| {
-            st.tuning = false;
-            st.capturing = false;
-            st.scanning = false;
-            st.playing = true;
+            st.monitoring = true;
             st.device = Some(device);
-            st.transponder_id = req.tune.transponder_id;
-            st.play_hls_url = Some(hls_url.clone());
-            st.play_service_id = Some(req.service_id);
+            st.signal = SignalStatus::default();
+            st.services.clear();
             st.last_error = None;
         })
         .await;
-
-        // Notify the UI only once the HLS manifest exists (ffmpeg needs ~10-15 s
-        // to lock, zap and reach the first keyframe). Cancel any prior watcher so
-        // channel switches do not emit stale PlayStarted events.
-        let mgr = Arc::clone(self);
-        let m3u8_watch = m3u8_path.clone();
-        let sid = req.service_id;
-        let url = hls_url.clone();
-        let generation = {
-            let mut inner = self.inner.lock().await;
-            if let Some(h) = inner.play_hls_watch.take() {
-                h.abort();
-            }
-            inner.play_generation += 1;
-            inner.play_generation
-        };
-        let watch = tokio::spawn(async move {
-            for _ in 0..45 {
-                let still_current = {
-                    let inner = mgr.inner.lock().await;
-                    inner.play_generation == generation
-                };
-                if !still_current {
-                    return;
-                }
-                if tokio::fs::metadata(&m3u8_watch).await.is_ok() {
-                    let still_current = {
-                        let inner = mgr.inner.lock().await;
-                        inner.play_generation == generation
-                    };
-                    if still_current {
-                        let _ = mgr.bus.send(WsEvent::PlayStarted {
-                            hls_url: url,
-                            service_id: sid,
-                        });
-                    }
-                    return;
-                }
-                tokio::time::sleep(Duration::from_secs(1)).await;
-            }
-            let still_current = {
-                let inner = mgr.inner.lock().await;
-                inner.play_generation == generation
-            };
-            if still_current {
-                mgr.emit_error(
-                    "HLS manifest not created after 45 s — check ~/.config/dvbhub/dvbhub.log"
-                        .into(),
-                );
-            }
-        });
-        {
-            let mut inner = self.inner.lock().await;
-            inner.play_hls_watch = Some(watch);
-        }
-
-        Ok(hls_url)
+        Ok(())
     }
 
-    /// Stops live playback.
-    pub async fn stop_play(&self) {
+    // ---- capture -------------------------------------------------------
+
+    /// Starts a capture job (one TP, a whole satellite, a terrestrial or cable mux).
+    pub async fn start_capture(self: &Arc<Self>, job_spec: CaptureJob) -> anyhow::Result<()> {
+        self.stop_tuner().await;
+        let capture_dir = self.config.read().await.capture_dir.clone();
+        let (label, device, total, targets): (String, String, usize, Vec<String>) = match &job_spec
         {
-            let mut inner = self.inner.lock().await;
-            inner.play_generation += 1;
-            if let Some(h) = inner.play_hls_watch.take() {
-                h.abort();
+            CaptureJob::Satellite { satellite, device, .. } => (
+                satellite.name.clone(),
+                device.clone(),
+                satellite.transponders.len(),
+                satellite
+                    .transponders
+                    .iter()
+                    .map(|t| format!("{} {}", t.frequency_mhz, pol_initial(&t.polarity)))
+                    .collect(),
+            ),
+            CaptureJob::Terrestrial { mux, device, .. } => {
+                (mux.label.clone(), device.clone(), 1, vec![mux.label.clone()])
             }
-        }
-        let (child, task) = {
-            let mut inner = self.inner.lock().await;
-            (inner.play_child.take(), inner.play_log_task.take())
+            CaptureJob::Cable { mux, device, .. } => {
+                (mux.label.clone(), device.clone(), 1, vec![mux.label.clone()])
+            }
         };
-        if let Some(mut c) = child {
-            self.action("PLAY stop");
-            graceful_stop(&mut c).await;
-        }
-        if let Some(t) = task {
-            let _ = t.await;
-        }
-        let hls_root = self.config.read().await.hls_dir();
-        clean_hls_tree(&hls_root).await;
+        anyhow::ensure!(total > 0, "nothing to capture");
+        self.action(format!("CAPTURE start {label} ({total} target(s)) on {device}"));
+
+        let mut job = self.new_job("capture");
+        let id = job.id;
+        let cancel = Arc::clone(&job.cancel);
+        let mgr = Arc::clone(self);
+        let paths = Arc::clone(&self.paths);
+        let handle = tokio::runtime::Handle::current();
+        job.task = Some(tokio::task::spawn_blocking(move || {
+            let (tx, rx) = std::sync::mpsc::channel::<CaptureEvent>();
+            let fwd_mgr = Arc::clone(&mgr);
+            let fwd_handle = handle.clone();
+            let forwarder = std::thread::spawn(move || {
+                for ev in rx {
+                    fwd_handle.block_on(fwd_mgr.on_capture_event(ev));
+                }
+            });
+            let mut files = Vec::new();
+            let (mut ok, mut failed) = (0usize, 0usize);
+            run_capture_job(
+                &paths,
+                &job_spec,
+                &capture_dir,
+                &cancel,
+                &tx,
+                |index, current| {
+                    handle.block_on(mgr.set_status(|st| {
+                        if let Some(c) = st.capture.as_mut() {
+                            c.index = index;
+                            c.current = current.to_string();
+                            c.remaining_s = None;
+                        }
+                    }));
+                },
+                |result| match result {
+                    Ok((locked, ts, sidecar)) => {
+                        if locked {
+                            ok += 1;
+                        } else {
+                            failed += 1;
+                        }
+                        let line = if sidecar.is_file() {
+                            format!("saved {} (+ sidecar)", ts.display())
+                        } else {
+                            format!("saved {}", ts.display())
+                        };
+                        let _ = mgr.bus.send(WsEvent::Log { line });
+                        files.push(ts.to_string_lossy().into_owned());
+                        let f = files.clone();
+                        handle.block_on(mgr.set_status(|st| {
+                            if let Some(c) = st.capture.as_mut() {
+                                c.files = f;
+                            }
+                        }));
+                    }
+                    Err(e) => {
+                        failed += 1;
+                        handle.block_on(mgr.error(format!("capture failed: {e:#}")));
+                    }
+                },
+            );
+            drop(tx);
+            let _ = forwarder.join();
+            let cancelled = cancel.load(Ordering::SeqCst);
+            handle.block_on(async {
+                if mgr.finish_tuner_job(id).await {
+                    mgr.set_status(|st| st.capturing = false).await;
+                }
+                mgr.action(format!(
+                    "CAPTURE {}: {ok} ok, {failed} failed",
+                    if cancelled { "stopped" } else { "done" }
+                ));
+                let _ = mgr.bus.send(WsEvent::CaptureDone {
+                    files,
+                    ok,
+                    failed,
+                    cancelled,
+                });
+            });
+        }));
+        self.inner.lock().await.tuner = Some(job);
         self.set_status(|st| {
-            st.playing = false;
-            st.play_hls_url = None;
-            st.play_service_id = None;
+            st.capturing = true;
+            st.device = Some(device);
+            st.signal = SignalStatus::default();
+            st.services.clear();
+            st.capture = Some(CaptureProgress {
+                label,
+                index: 0,
+                total,
+                current: targets.first().cloned().unwrap_or_default(),
+                remaining_s: None,
+                files: Vec::new(),
+            });
+            st.last_error = None;
         })
         .await;
+        Ok(())
+    }
+
+    async fn on_capture_event(&self, ev: CaptureEvent) {
+        match ev {
+            CaptureEvent::Signal(sig) => self.push_signal(sig).await,
+            CaptureEvent::Services(lines) => {
+                let _ = self.bus.send(WsEvent::Log {
+                    line: format!("services: {}", lines.join(" · ")),
+                });
+            }
+            CaptureEvent::RecordingRemaining(s) => {
+                self.set_status(|st| {
+                    if let Some(c) = st.capture.as_mut() {
+                        c.remaining_s = Some(s);
+                    }
+                })
+                .await
+            }
+            CaptureEvent::Command(line) | CaptureEvent::Status(line) | CaptureEvent::Log(line) => {
+                let _ = self.bus.send(WsEvent::Log { line });
+            }
+        }
+    }
+
+    // ---- scan ----------------------------------------------------------
+
+    /// Starts a channel scan; found channels are optionally saved.
+    pub async fn start_scan(self: &Arc<Self>, spec: ScanJob) -> anyhow::Result<()> {
+        anyhow::ensure!(!spec.targets.is_empty(), "nothing to scan");
+        self.stop_tuner().await;
+        let total = spec.targets.len();
+        self.action(format!("SCAN start {total} target(s) on {}", spec.device));
+        let mut job = self.new_job("scan");
+        let id = job.id;
+        let cancel = Arc::clone(&job.cancel);
+        let mgr = Arc::clone(self);
+        let paths = Arc::clone(&self.paths);
+        let handle = tokio::runtime::Handle::current();
+        let device = spec.device.clone();
+        job.task = Some(tokio::task::spawn_blocking(move || {
+            let (mut locked, mut found) = (0usize, 0usize);
+            let results = channel_scan::scan(&paths, &spec.targets, &spec.opts, &cancel, |ev| {
+                match ev {
+                    ScanEvent::TargetStart { index, total, label } => {
+                        handle.block_on(mgr.set_status(|st| {
+                            st.scan = Some(ScanProgress {
+                                index: index + 1,
+                                total,
+                                current: label,
+                                locked,
+                                found,
+                            });
+                        }));
+                    }
+                    ScanEvent::TargetDone { total, result } => {
+                        if result.locked {
+                            locked += 1;
+                            found += result.wanted_count(&spec.opts);
+                            handle.block_on(mgr.push_signal(SignalStatus {
+                                locked: true,
+                                snr_db: result.snr_db,
+                                strength_db: result.strength_db,
+                                ..Default::default()
+                            }));
+                        }
+                        let kept = result.wanted_count(&spec.opts);
+                        let _ = mgr.bus.send(WsEvent::ScanTarget { total, kept, result });
+                    }
+                }
+            });
+            let channels = channel_scan::channels_from_results(&results, &spec.targets, &spec.opts);
+            let cancelled = cancel.load(Ordering::SeqCst);
+            handle.block_on(async {
+                let mut added = 0;
+                if spec.save && !channels.is_empty() {
+                    let db = {
+                        let mut db = mgr.channels.write().await;
+                        if spec.replace {
+                            let first = &spec.targets[0];
+                            db.channels.retain(|c| {
+                                !(c.delivery == first.delivery && c.satellite == first.satellite)
+                            });
+                        }
+                        let base = db.channels.iter().map(|c| c.scan_index).max().unwrap_or(0);
+                        let batch = channels
+                            .iter()
+                            .cloned()
+                            .enumerate()
+                            .map(|(i, mut c)| {
+                                c.scan_index = base + 1 + i as u32;
+                                c
+                            })
+                            .collect();
+                        added = db.add_batch(batch);
+                        db.clone()
+                    };
+                    if let Err(e) = tokio::task::spawn_blocking(move || db.save()).await {
+                        mgr.error(format!("saving channels failed: {e}")).await;
+                    }
+                }
+                if mgr.finish_tuner_job(id).await {
+                    mgr.set_status(|st| st.scanning = false).await;
+                }
+                mgr.action(format!(
+                    "SCAN {}: {locked}/{} locked, {} channel(s), {added} added",
+                    if cancelled { "stopped" } else { "done" },
+                    results.len(),
+                    channels.len()
+                ));
+                let _ = mgr.bus.send(WsEvent::ScanDone {
+                    locked,
+                    total: results.len(),
+                    found: channels.len(),
+                    added,
+                    cancelled,
+                });
+            });
+        }));
+        self.inner.lock().await.tuner = Some(job);
+        self.set_status(|st| {
+            st.scanning = true;
+            st.device = Some(device);
+            st.signal = SignalStatus::default();
+            st.scan = Some(ScanProgress {
+                total,
+                ..Default::default()
+            });
+            st.last_error = None;
+        })
+        .await;
+        Ok(())
+    }
+
+    // ---- play (watch in the browser) ------------------------------------
+
+    /// Starts live playback: `tsp -P zap <sid> -O fork ffmpeg … HLS`.
+    pub async fn start_play(self: &Arc<Self>, spec: PlayJob) -> anyhow::Result<String> {
+        self.stop_tuner().await;
+        let id = self.next_id.load(Ordering::SeqCst);
+        let dir = hls_root().join(format!("s{}-{id}", spec.service_id));
+        tokio::fs::create_dir_all(&dir)
+            .await
+            .with_context(|| format!("cannot create HLS dir {}", dir.display()))?;
+        let m3u8 = dir.join("stream.m3u8");
+        let mut args = spec.params.to_tsp_args();
+        if let Some(i) = args.iter().position(|a| a == "-O") {
+            args.truncate(i);
+        }
+        // Video is re-encoded for the browser: broadcast video is often
+        // interlaced, open-GOP H.264 (no IDR frames; Chrome's decoder rejects the
+        // leading pictures) or MPEG-2 (not playable in browsers at all). A cheap
+        // 720p x264 encode (~0.5 core) with an IDR every second makes every 1 s
+        // segment start cleanly, so playback begins within a few seconds.
+        // Audio is AAC (browsers cannot play MPEG-1/2 audio). Only the first
+        // video and audio streams are mapped; teletext/data would break the muxer.
+        let ffmpeg = format!(
+            "ffmpeg -hide_banner -loglevel error -fflags +genpts+discardcorrupt+nobuffer \
+             -analyzeduration 1M -probesize 1M -i pipe:0 -map 0:v:0 -map 0:a:0? \
+             -vf yadif=0:-1:0,scale=-2:720 -c:v libx264 -preset veryfast -tune zerolatency \
+             -g 25 -keyint_min 25 -sc_threshold 0 -b:v 3M -maxrate 3500k -bufsize 6M \
+             -c:a aac -b:a 128k -ac 2 -f hls -hls_time 1 -hls_list_size 6 \
+             -hls_flags delete_segments+omit_endlist+independent_segments \
+             -hls_segment_type fmp4 -hls_fmp4_init_filename init.mp4 {}",
+            m3u8.display()
+        );
+        args.extend(["-P".into(), "zap".into(), spec.service_id.to_string(), "-O".into(), "fork".into(), ffmpeg]);
+        let url = format!("/hls/s{}-{id}/stream.m3u8", spec.service_id);
+        self.action(format!(
+            "PLAY start '{}' sid={} on {}",
+            spec.name,
+            spec.service_id,
+            spec.params.device_name.clone().unwrap_or_default()
+        ));
+        let mut child = spawn_tsp(&self.paths, &args)?;
+        let mut job = self.new_job("play");
+        let job_id = job.id;
+        let logger = spawn_child_logger(self, &mut child);
+        let mgr = Arc::clone(self);
+        let (sid, url_ready, m3u8_wait) = (spec.service_id, url.clone(), m3u8.clone());
+        let started = Instant::now();
+        job.task = Some(tokio::spawn(async move {
+            // Announce once the manifest lists at least one segment.
+            let deadline = started + Duration::from_secs(45);
+            let mut ready = false;
+            while Instant::now() < deadline {
+                if !mgr.is_active(job_id).await {
+                    break;
+                }
+                if let Ok(text) = tokio::fs::read_to_string(&m3u8_wait).await {
+                    if text.contains("#EXTINF") {
+                        ready = true;
+                        break;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+            if ready {
+                let secs = started.elapsed().as_secs_f64();
+                mgr.action(format!("PLAY ready after {secs:.1} s"));
+                mgr.set_status(|st| {
+                    if let Some(p) = st.play.as_mut() {
+                        p.ready = true;
+                        p.ready_after_s = Some(secs);
+                    }
+                })
+                .await;
+                let _ = mgr.bus.send(WsEvent::PlayReady {
+                    hls_url: url_ready,
+                    service_id: sid,
+                });
+            } else if mgr.is_active(job_id).await {
+                mgr.error("no video after 45 s (no lock, scrambled or off-air service?)".into())
+                    .await;
+            }
+            if let Some(l) = logger {
+                let _ = l.await;
+            }
+            // tsp ended (or job replaced): clear the slot if it is still ours.
+            if mgr.finish_tuner_job(job_id).await {
+                mgr.set_status(|st| {
+                    st.playing = false;
+                    st.play = None;
+                })
+                .await;
+            }
+        }));
+        job.child = Some(child);
+        self.inner.lock().await.tuner = Some(job);
+        self.set_status(|st| {
+            st.playing = true;
+            st.device = spec.params.device_name.clone();
+            st.signal = SignalStatus::default();
+            st.play = Some(PlayInfo {
+                hls_url: url.clone(),
+                service_id: spec.service_id,
+                channel_id: spec.channel_id,
+                name: spec.name.clone(),
+                ready: false,
+                ready_after_s: None,
+            });
+            st.last_error = None;
+        })
+        .await;
+        Ok(url)
+    }
+
+    async fn is_active(&self, id: u64) -> bool {
+        self.inner.lock().await.tuner.as_ref().is_some_and(|j| j.id == id)
+    }
+
+    // ---- playout (DTU-315) -------------------------------------------------
+
+    /// Starts a playout; independent of the tuner slot.
+    pub async fn start_playout(self: &Arc<Self>, params: PlayParams) -> anyhow::Result<()> {
+        self.stop_playout().await;
+        let args = params.to_tsp_args();
+        self.action(format!(
+            "PLAYOUT start {} @ {} MHz {}{}",
+            params.input,
+            params.frequency_hz / 1_000_000,
+            params.modulation,
+            if params.infinite { " (loop)" } else { "" }
+        ));
+        let mut child = spawn_tsp(&self.paths, &args)?;
+        let logger = spawn_child_logger(self, &mut child);
+        let mut job = self.new_job("playout");
+        let id = job.id;
+        let mgr = Arc::clone(self);
+        job.task = Some(tokio::spawn(async move {
+            if let Some(l) = logger {
+                let _ = l.await;
+            }
+            // stdout/stderr closed: tsp finished (end of file) or was stopped.
+            let mine = {
+                let mut inner = mgr.inner.lock().await;
+                if inner.modulator.as_ref().is_some_and(|j| j.id == id) {
+                    inner.modulator.take()
+                } else {
+                    None
+                }
+            };
+            if let Some(job) = mine {
+                stop_job(job).await;
+                mgr.action("PLAYOUT finished");
+                mgr.set_status(|st| {
+                    st.playout = false;
+                    st.playout_file = None;
+                })
+                .await;
+            }
+        }));
+        job.child = Some(child);
+        self.inner.lock().await.modulator = Some(job);
+        let file = params.input.clone();
+        self.set_status(|st| {
+            st.playout = true;
+            st.playout_file = Some(file);
+            st.last_error = None;
+        })
+        .await;
+        Ok(())
     }
 }
 
-/// Removes stale HLS artefacts (`*.ts`, `*.m3u8`, `*.vtt`) in one directory.
-async fn clean_hls_dir(dir: &std::path::Path) {
-    if let Ok(mut entries) = tokio::fs::read_dir(dir).await {
-        while let Ok(Some(entry)) = entries.next_entry().await {
-            let path = entry.path();
-            let remove = matches!(
-                path.extension().and_then(|e| e.to_str()),
-                Some("ts") | Some("m3u8") | Some("vtt")
-            );
-            if remove {
-                let _ = tokio::fs::remove_file(&path).await;
+/// Runs a capture job synchronously (blocking thread). `on_target` is called
+/// before each target, `on_done` after it with `(locked, ts, sidecar)`.
+fn run_capture_job(
+    paths: &TsduckPaths,
+    job: &CaptureJob,
+    capture_dir: &std::path::Path,
+    cancel: &Arc<AtomicBool>,
+    events: &std::sync::mpsc::Sender<CaptureEvent>,
+    mut on_target: impl FnMut(usize, &str),
+    mut on_done: impl FnMut(anyhow::Result<(bool, std::path::PathBuf, std::path::PathBuf)>),
+) {
+    const SIGNAL_TIMEOUT_S: u32 = 10;
+    match job {
+        CaptureJob::Satellite { satellite, device, seconds } => {
+            let root = capture_dir.join(crate::sat_capture::satellite_slug(&satellite.name));
+            for (i, tp) in satellite.transponders.iter().enumerate() {
+                if cancel.load(Ordering::SeqCst) {
+                    break;
+                }
+                on_target(i + 1, &tp_label(tp));
+                let r = crate::sat_capture::capture_transponder(
+                    paths,
+                    satellite,
+                    device,
+                    tp,
+                    *seconds,
+                    SIGNAL_TIMEOUT_S,
+                    &root,
+                    true,
+                    Some(events.clone()),
+                    Some(Arc::clone(cancel)),
+                )
+                .map(|o| (o.run.ever_locked, o.ts_path, o.services_path));
+                on_done(r);
             }
+        }
+        CaptureJob::Terrestrial { mux, device, seconds } => {
+            on_target(1, &mux.label);
+            let r = crate::terr_capture::capture_mux(
+                paths,
+                device,
+                mux,
+                *seconds,
+                SIGNAL_TIMEOUT_S,
+                &capture_dir.join("terrestrial"),
+                true,
+                Some(events.clone()),
+                Some(Arc::clone(cancel)),
+            )
+            .map(|o| (o.run.ever_locked, o.ts_path, o.services_path));
+            on_done(r);
+        }
+        CaptureJob::Cable { mux, device, seconds } => {
+            on_target(1, &mux.label);
+            let r = crate::cable_capture::capture_mux(
+                paths,
+                device,
+                mux,
+                *seconds,
+                SIGNAL_TIMEOUT_S,
+                &capture_dir.join("cable"),
+                true,
+                Some(events.clone()),
+                Some(Arc::clone(cancel)),
+            )
+            .map(|o| (o.run.ever_locked, o.ts_path, o.services_path));
+            on_done(r);
         }
     }
 }
 
-/// Removes all per-service HLS subdirectories under the HLS root.
+fn tp_label(tp: &SatTransponder) -> String {
+    format!(
+        "{} {} {} {}",
+        tp.frequency_mhz,
+        pol_initial(&tp.polarity),
+        tp.symbol_rate_ksps,
+        tp.delivery_system
+    )
+}
+
+fn pol_initial(p: &str) -> char {
+    p.chars().next().unwrap_or('?').to_ascii_uppercase()
+}
+
+/// Stops a job: cancel flag, SIGTERM to its child, then wait for the task.
+async fn stop_job(mut job: Job) {
+    job.cancel.store(true, Ordering::SeqCst);
+    if let Some(mut c) = job.child.take() {
+        graceful_stop(&mut c).await;
+    }
+    if let Some(t) = job.task.take() {
+        // Blocking capture/scan jobs notice the flag within ~0.5 s and kill tsp.
+        let _ = tokio::time::timeout(Duration::from_secs(15), t).await;
+    }
+}
+
+/// HLS working directory on tmpfs (`$XDG_RUNTIME_DIR/dvbhub-hls`, else `/tmp`).
+pub fn hls_root() -> std::path::PathBuf {
+    std::env::var_os("XDG_RUNTIME_DIR")
+        .map(std::path::PathBuf::from)
+        .filter(|p| p.is_dir())
+        .unwrap_or_else(std::env::temp_dir)
+        .join("dvbhub-hls")
+}
+
+/// Removes all per-session HLS directories.
 async fn clean_hls_tree(root: &std::path::Path) {
     if let Ok(mut entries) = tokio::fs::read_dir(root).await {
         while let Ok(Some(entry)) = entries.next_entry().await {
-            let path = entry.path();
-            if path.is_dir() {
-                let _ = tokio::fs::remove_dir_all(&path).await;
-            } else {
-                let remove = matches!(
-                    path.extension().and_then(|e| e.to_str()),
-                    Some("ts") | Some("m3u8") | Some("vtt")
-                );
-                if remove {
-                    let _ = tokio::fs::remove_file(&path).await;
-                }
-            }
+            let _ = tokio::fs::remove_dir_all(entry.path()).await;
         }
     }
 }
 
-/// Takes a child's stdout/stderr and spawns a task that streams every line to
-/// WebSocket log subscribers (and surfaces errors). Returns the task handle.
-fn take_child_logger(
+/// Streams a child's stdout/stderr to the log bus (signal lines update status).
+fn spawn_child_logger(
     mgr: &Arc<SessionManager>,
     child: &mut Child,
 ) -> Option<tokio::task::JoinHandle<()>> {
-    let stdout = child.stdout.take();
-    let stderr = child.stderr.take();
-    if stdout.is_none() && stderr.is_none() {
-        return None;
-    }
+    let (out, err) = (child.stdout.take(), child.stderr.take());
     let mgr = Arc::clone(mgr);
     Some(tokio::spawn(async move {
-        match (stdout, stderr) {
+        match (out, err) {
             (Some(o), Some(e)) => {
                 tokio::join!(stream_logs(o, mgr.clone(), false), stream_logs(e, mgr, true));
             }
@@ -1190,8 +896,6 @@ fn take_child_logger(
     }))
 }
 
-/// Streams a reader line-by-line to the log bus without buffering the whole
-/// output; flags lines containing "error" as session errors.
 async fn stream_logs(
     reader: impl tokio::io::AsyncRead + Unpin,
     mgr: Arc<SessionManager>,
@@ -1199,304 +903,163 @@ async fn stream_logs(
 ) {
     let mut lines = BufReader::new(reader).lines();
     while let Ok(Some(line)) = lines.next_line().await {
-        if is_noise_line(&line) {
+        if is_noise_line(&line) || line.trim().is_empty() {
             continue;
         }
         if is_stderr {
             if let Some(sig) = parse_signal_line(&line).or_else(|| parse_dvbstatus_line(&line)) {
                 mgr.push_signal(sig).await;
             }
-            if line.contains("error") || line.contains("Error") {
-                mgr.emit_error(line.clone());
+            if line.contains("Error") {
+                let msg = match crate::tsduck::explain_error(&line) {
+                    Some(hint) => format!("{} — {hint}", line.trim()),
+                    None => line.trim().to_string(),
+                };
+                mgr.error(msg).await;
+                continue;
             }
         }
-        if !line.trim().is_empty() {
-            let _ = mgr.bus.send(WsEvent::Log { line });
-        }
+        let _ = mgr.bus.send(WsEvent::Log { line });
     }
 }
 
-/// Transient ffmpeg/decoder chatter that floods the log when a live stream is
-/// joined mid-GOP (before the first keyframe / PMT). These are not real errors;
-/// dropping them keeps the activity log readable.
+/// Decoder chatter while joining a live stream mid-GOP; not real errors.
 fn is_noise_line(line: &str) -> bool {
     let t = line.trim();
-    t.contains("non-existing PPS")
-        || t.contains("no frame!")
-        || t.contains("sps_id")
-        || t.contains("PES packet size mismatch")
-        || t.contains("Packet corrupt")
-        || t.contains("corrupt input packet")
-        || t.starts_with("Last message repeated")
-        || t.contains("Could not find codec parameters")
-        || t.contains("Consider increasing the value")
+    [
+        "non-existing PPS",
+        "no frame!",
+        "sps_id",
+        "PES packet size mismatch",
+        "Packet corrupt",
+        "corrupt input packet",
+        "Last message repeated",
+        "Could not find codec parameters",
+        "Consider increasing the value",
+        "mmco: unref short failure",
+        "reference picture missing",
+        "Missing reference picture",
+    ]
+    .iter()
+    .any(|n| t.contains(n))
 }
 
-/// Sends SIGTERM first so `tsp` can flush outputs, then SIGKILL if needed.
+/// SIGTERM so `tsp` can flush, then SIGKILL after 5 s.
 async fn graceful_stop(child: &mut Child) {
-    #[cfg(unix)]
     if let Some(pid) = child.id() {
-        let _ = std::process::Command::new("kill")
-            .args(["-TERM", &pid.to_string()])
-            .status();
-        let _ = tokio::time::timeout(Duration::from_secs(8), child.wait()).await;
+        unsafe {
+            libc::kill(pid as libc::pid_t, libc::SIGTERM);
+        }
+        if tokio::time::timeout(Duration::from_secs(5), child.wait()).await.is_ok() {
+            return;
+        }
     }
     let _ = child.kill().await;
     let _ = child.wait().await;
 }
 
-async fn spawn_tsp(paths: &TsduckPaths, args: &[String]) -> anyhow::Result<Child> {
+fn spawn_tsp(paths: &TsduckPaths, args: &[String]) -> anyhow::Result<Child> {
     let bin = paths.tool("tsp");
-    let child = Command::new(&bin)
-        .arg("--verbose")
+    let mut cmd = Command::new(&bin);
+    cmd.arg("--verbose")
         .args(args)
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .with_context(|| format!("failed to spawn {}", bin.display()))?;
-    Ok(child)
+        .kill_on_drop(true);
+    // tsp must not outlive the server (it would keep the tuner busy).
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM);
+            Ok(())
+        });
+    }
+    cmd.spawn()
+        .with_context(|| format!("failed to start {}", bin.display()))
 }
 
-async fn read_tune_output(
+/// Reads a monitor `tsp`: analyze JSON on stdout, signal lines on stderr.
+async fn read_monitor_output(
     mgr: Arc<SessionManager>,
     stdout: impl tokio::io::AsyncRead + Unpin + Send,
     stderr: impl tokio::io::AsyncRead + Unpin + Send,
 ) {
-    let mut stdout_lines = BufReader::new(stdout).lines();
-    let mut stderr_lines = BufReader::new(stderr).lines();
-    let mut json_buf = String::new();
-    let mut json_depth: i32 = 0;
-
-    loop {
+    let mut out = BufReader::new(stdout).lines();
+    let mut err = BufReader::new(stderr).lines();
+    let (mut buf, mut depth) = (String::new(), 0i32);
+    let (mut out_open, mut err_open) = (true, true);
+    while out_open || err_open {
         tokio::select! {
-            line = stdout_lines.next_line() => {
-                match line {
-                    Ok(Some(line)) => {
-                        if let Some(doc) = feed_json_chunk(&mut json_buf, &mut json_depth, &line) {
-                            try_parse_analyze_json(&mgr, &doc).await;
-                        }
-                        if json_depth == 0
-                            && !line.trim().is_empty()
-                            && !is_analyze_json_line(&line)
-                        {
-                            let _ = mgr.bus.send(WsEvent::Log { line });
+            line = out.next_line(), if out_open => match line {
+                Ok(Some(line)) => {
+                    if let Some(doc) = crate::analyze::feed_json_chunk(&mut buf, &mut depth, &line) {
+                        let services = crate::analyze::services_from_analyze_json(&doc);
+                        if !services.is_empty() {
+                            mgr.push_services(services).await;
                         }
                     }
-                    Ok(None) => break,
-                    Err(_) => break,
                 }
-            }
-            line = stderr_lines.next_line() => {
-                match line {
-                    Ok(Some(line)) => {
-                        if let Some(sig) = parse_signal_line(&line).or_else(|| parse_dvbstatus_line(&line)) {
-                            mgr.push_signal(sig).await;
-                        }
-                        if line.contains("error") || line.contains("Error") {
-                            mgr.emit_error(line.clone());
-                        }
+                _ => out_open = false,
+            },
+            line = err.next_line(), if err_open => match line {
+                Ok(Some(line)) => {
+                    if let Some(sig) = parse_signal_line(&line).or_else(|| parse_dvbstatus_line(&line)) {
+                        mgr.push_signal(sig).await;
+                    }
+                    if line.contains("Error") {
+                        mgr.error(line.trim().to_string()).await;
+                    } else {
                         let _ = mgr.bus.send(WsEvent::Log { line });
                     }
-                    Ok(None) => break,
-                    Err(_) => break,
                 }
-            }
+                _ => err_open = false,
+            },
         }
     }
 }
 
-/// Accumulates stdout until a complete top-level JSON object is seen.
-fn feed_json_chunk(buf: &mut String, depth: &mut i32, chunk: &str) -> Option<String> {
-    for ch in chunk.chars() {
-        if *depth == 0 && ch != '{' {
-            continue;
-        }
-        buf.push(ch);
-        match ch {
-            '{' => *depth += 1,
-            '}' => {
-                *depth -= 1;
-                if *depth == 0 {
-                    let doc = buf.clone();
-                    buf.clear();
-                    return Some(doc);
-                }
-            }
-            _ => {}
-        }
-    }
-    None
-}
-
-async fn read_process_output(
-    mgr: Arc<SessionManager>,
-    stdout: impl tokio::io::AsyncRead + Unpin + Send,
-    stderr: impl tokio::io::AsyncRead + Unpin + Send,
-) -> String {
-    let (out, err) = tokio::join!(
-        read_stream_to_string(stdout, mgr.clone()),
-        read_stream_to_string(stderr, mgr),
-    );
-    format!("{out}{err}")
-}
-
-async fn read_stream_to_string(
-    mut reader: impl tokio::io::AsyncRead + Unpin,
-    mgr: Arc<SessionManager>,
-) -> String {
-    use tokio::io::AsyncReadExt;
-    let mut buf = Vec::new();
-    if reader.read_to_end(&mut buf).await.is_ok() {
-        let text = String::from_utf8_lossy(&buf).into_owned();
-        for line in text.lines() {
-            if !line.trim().is_empty() {
-                let _ = mgr.bus.send(WsEvent::Log {
-                    line: line.to_string(),
-                });
-            }
-        }
-        text
-    } else {
-        String::new()
-    }
-}
-
-async fn try_parse_analyze_json(mgr: &Arc<SessionManager>, text: &str) {
-    let services = crate::analyze::services_from_analyze_json(text);
-    if !services.is_empty() {
-        mgr.push_services(services).await;
-    }
-}
-
-fn tsscan_args_from_params(p: &CaptureParams) -> Vec<String> {
-    let mut a = vec!["--nit-scan".to_string()];
-    if let Some(name) = &p.device_name {
-        a.push("--device-name".into());
-        a.push(name.clone());
-    }
-    if let Some(ad) = p.adapter {
-        a.push("--adapter".into());
-        a.push(ad.to_string());
-    }
-    a.push("--delivery-system".into());
-    a.push(p.delivery_system.clone());
-    a.push("--frequency".into());
-    a.push(p.frequency_hz.to_string());
-    if let Some(pol) = &p.polarity {
-        a.push("--polarity".into());
-        a.push(pol.clone());
-    }
-    if let Some(sr) = p.symbol_rate {
-        a.push("--symbol-rate".into());
-        a.push(sr.to_string());
-    }
-    if let Some(m) = &p.modulation {
-        a.push("--modulation".into());
-        a.push(m.clone());
-    }
-    if let Some(f) = &p.fec {
-        a.push("--fec-inner".into());
-        a.push(f.clone());
-    }
-    if let Some(sn) = p.satellite_number {
-        a.push("--satellite-number".into());
-        a.push(sn.to_string());
-    }
-    a.push("--signal-timeout".into());
-    a.push(p.signal_timeout_s.to_string());
-    a
-}
-
-async fn spawn_tsscan(paths: &TsduckPaths, args: &[String]) -> anyhow::Result<Child> {
-    let bin = paths.tool("tsscan");
-    let child = Command::new(&bin)
-        .args(args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .with_context(|| format!("failed to spawn {}", bin.display()))?;
-    Ok(child)
-}
-
-/// True for lines that belong to `tsp -P analyze --json` output (not tool logs).
-fn is_analyze_json_line(s: &str) -> bool {
-    let t = s.trim();
-    t.starts_with('{')
-        || t == "}"
-        || t == "},"
-        || t == "]"
-        || t == "],"
-        || (t.starts_with('"') && t.contains(':'))
-        || (t.starts_with("  \"") && t.contains(':'))
-}
-
-/// Current local time as `YYYY-MM-DD HH:MM:SS.mmm` for log prefixes.
 fn now_ts() -> String {
     chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f").to_string()
 }
 
-/// Appends every log/error/action event to a file with timestamps so the user
-/// can review which UI actions were taken and what the tools reported.
+/// Appends log/error/milestone events to the log file.
 async fn file_logger(mut rx: broadcast::Receiver<WsEvent>, path: std::path::PathBuf) {
     use tokio::io::AsyncWriteExt;
     if let Some(parent) = path.parent() {
         let _ = tokio::fs::create_dir_all(parent).await;
     }
-    let mut file = match tokio::fs::OpenOptions::new()
+    let Ok(mut file) = tokio::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(&path)
         .await
-    {
-        Ok(f) => f,
-        Err(e) => {
-            eprintln!("warning: cannot open log file {}: {e}", path.display());
-            return;
-        }
+    else {
+        eprintln!("warning: cannot open log file {}", path.display());
+        return;
     };
     let _ = file
-        .write_all(format!("\n===== dvbhub started {} =====\n", now_ts()).as_bytes())
+        .write_all(format!("\n===== dvbhub serve started {} =====\n", now_ts()).as_bytes())
         .await;
-    let _ = file.flush().await;
-
     loop {
-        match rx.recv().await {
-            Ok(ev) => {
-                let entry = match ev {
-                    WsEvent::Log { line } => Some(format!("[{}] {}\n", now_ts(), line)),
-                    WsEvent::Error { message } => {
-                        Some(format!("[{}] ERROR {}\n", now_ts(), message))
-                    }
-                    WsEvent::ScanComplete { transponders } => Some(format!(
-                        "[{}] >>> NIT scan complete: {} transponders\n",
-                        now_ts(),
-                        transponders.len()
-                    )),
-                    WsEvent::PlayStarted { service_id, .. } => Some(format!(
-                        "[{}] >>> PLAY ready: service {} (HLS)\n",
-                        now_ts(),
-                        service_id
-                    )),
-                    // Status/Signal/Services are high-frequency; skip in file.
-                    _ => None,
-                };
-                if let Some(line) = entry {
-                    if file.write_all(line.as_bytes()).await.is_err() {
-                        break;
-                    }
-                    let _ = file.flush().await;
-                }
+        let entry = match rx.recv().await {
+            Ok(WsEvent::Log { line }) => format!("[{}] {line}\n", now_ts()),
+            Ok(WsEvent::Error { message }) => format!("[{}] ERROR {message}\n", now_ts()),
+            Ok(WsEvent::ScanDone { locked, total, found, added, .. }) => format!(
+                "[{}] >>> scan done {locked}/{total} locked, {found} found, {added} added\n",
+                now_ts()
+            ),
+            Ok(WsEvent::CaptureDone { files, .. }) => {
+                format!("[{}] >>> capture done: {}\n", now_ts(), files.join(", "))
             }
+            Ok(_) => continue,
             Err(broadcast::error::RecvError::Lagged(n)) => {
-                let _ = file
-                    .write_all(
-                        format!("[{}] (log lagged, {n} events dropped)\n", now_ts()).as_bytes(),
-                    )
-                    .await;
+                format!("[{}] (log lagged, {n} events dropped)\n", now_ts())
             }
             Err(broadcast::error::RecvError::Closed) => break,
+        };
+        if file.write_all(entry.as_bytes()).await.is_err() {
+            break;
         }
+        let _ = file.flush().await;
     }
 }

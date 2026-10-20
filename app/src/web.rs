@@ -1,39 +1,35 @@
-//! Local web interface for dvbhub.
+//! Local web interface for dvbhub (`dvbhub serve`).
 //!
-//! `dvbhub serve` starts a small HTTP server (axum) on `localhost` that exposes
-//! the same engine the CLI uses: device discovery, reference transponders,
-//! live tuning with signal/services, capture control, and (later) scan/playback.
-//! The UI is a single embedded HTML page driven by a JSON API and WebSocket
-//! push updates.
+//! A small axum server on localhost exposes the same engine as the CLI/TUI:
+//! device discovery (with a hot-plug monitor), capture, channel scan, live
+//! watch in the browser (HLS), DTU-315 playout and the satellite / reference
+//! databases. Static UI files are embedded in the binary; progress is pushed
+//! over a WebSocket.
 
-use crate::analyze;
-use crate::channels::{ChannelDb, ChannelDelivery, SavedChannel};
+use crate::analyze::{self, CaptureServicesRecord};
+use crate::cable::CableMux;
+use crate::channel_scan::{self, ScanOptions};
+use crate::channels::{ChannelDb, ChannelDelivery};
 use crate::config::{AppConfig, TsduckPaths};
+use crate::devices::{DeliveryCategory, Discovery, DvbDevice};
 use crate::lastlog;
-use crate::devices::Discovery;
 use crate::monitor::{self, DeviceState};
+use crate::pipeline::CaptureParams;
 use crate::refdb::{ReferenceCapture, ReferenceCaptureDb, ReferenceTpDb};
-use crate::satellites::{SatTransponder, Satellite, SatelliteDb};
-use crate::session::{
-    CaptureStartRequest, PlayStartRequest, PlayoutRequest, SatCapturePlan, SessionManager,
-    TuneRequest, WsEvent,
-};
-use crate::transponders;
+use crate::satellites::{tsp_lnb_value, SatTransponder, Satellite, SatelliteDb};
+use crate::session::{self, CaptureJob, PlayJob, ScanJob, SessionManager, WsEvent};
+use crate::terrestrial::TerrestrialMux;
 use crate::tsduck;
-use tokio::sync::RwLock;
-use axum::{
-    extract::{
-        ws::{Message, WebSocket, WebSocketUpgrade},
-        Path as AxumPath, Query, State,
-    },
-    response::{Html, IntoResponse, Response},
-    routing::{get, post},
-    Json, Router,
-};
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::{header, StatusCode};
+use axum::response::{Html, IntoResponse, Response};
+use axum::routing::{delete, get, post};
+use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::json;
 use std::sync::Arc;
+use tokio::sync::{broadcast, RwLock};
 
 /// Shared application state handed to every request handler.
 #[derive(Clone)]
@@ -48,240 +44,235 @@ struct AppState {
     channels: Arc<RwLock<ChannelDb>>,
 }
 
-/// The single embedded UI page.
+/// Embedded static files: (URL path, content type, body).
+const STATIC_FILES: &[(&str, &str, &str)] = &[
+    ("app.css", "text/css; charset=utf-8", include_str!("../web/app.css")),
+    ("hls.js", "application/javascript", include_str!("../web/hls.min.js")),
+    ("js/api.js", "application/javascript", include_str!("../web/js/api.js")),
+    ("js/ui.js", "application/javascript", include_str!("../web/js/ui.js")),
+    ("js/main.js", "application/javascript", include_str!("../web/js/main.js")),
+    ("js/devices.js", "application/javascript", include_str!("../web/js/devices.js")),
+    ("js/capture.js", "application/javascript", include_str!("../web/js/capture.js")),
+    ("js/playback.js", "application/javascript", include_str!("../web/js/playback.js")),
+    ("js/watch.js", "application/javascript", include_str!("../web/js/watch.js")),
+];
+
 const INDEX_HTML: &str = include_str!("../web/index.html");
 
-/// Bundled hls.js so the UI works fully offline (no CDN dependency).
-const HLS_JS: &str = include_str!("../web/hls.min.js");
-
-/// Runs the web server until the process is interrupted. Blocking entry point
-/// for the CLI (`dvbhub serve`); builds its own Tokio runtime.
+/// Runs the web server until Ctrl-C (blocking; builds its own runtime).
 pub fn serve_blocking(bind: &str, port: u16) -> anyhow::Result<()> {
     lastlog::event("cmd.serve", &format!("bind={bind} port={port}"));
     let paths = TsduckPaths::resolve()?;
-    let rt = tokio::runtime::Builder::new_multi_thread()
+    tokio::runtime::Builder::new_multi_thread()
         .enable_all()
-        .build()?;
-    rt.block_on(serve(paths, bind, port))
+        .build()?
+        .block_on(serve(paths, bind, port))
 }
 
-/// Async server bootstrap.
 async fn serve(paths: TsduckPaths, bind: &str, port: u16) -> anyhow::Result<()> {
     let paths = Arc::new(paths);
     let cfg = AppConfig::load();
-    // Best-effort: ensure the capture directory exists and persist defaults on
-    // first run so the user has a concrete path to edit in the UI.
     if tokio::fs::create_dir_all(&cfg.capture_dir).await.is_err() {
-        eprintln!(
-            "warning: could not create capture dir {}",
-            cfg.capture_dir.display()
-        );
+        eprintln!("warning: could not create capture dir {}", cfg.capture_dir.display());
     }
     let _ = cfg.save();
     println!("config file: {}", crate::config::config_file_path().display());
     println!("capture dir: {}", cfg.capture_dir.display());
     println!("log file:    {}", crate::config::log_file_path().display());
+    println!("HLS dir:     {}", session::hls_root().display());
+
     let config = Arc::new(RwLock::new(cfg));
-
-    let (sessions, _rx) = SessionManager::new(paths.clone(), config.clone());
-
-    // Load persisted databases (seeded from bundled snapshots on first run).
-    let satellites = Arc::new(RwLock::new(SatelliteDb::load()));
-    let ref_tps = Arc::new(RwLock::new(ReferenceTpDb::load()));
-    let ref_caps = Arc::new(RwLock::new(ReferenceCaptureDb::load()));
     let channels = Arc::new(RwLock::new(ChannelDb::load()));
-
-    // Start the hotplug monitor; it keeps `device_state` fresh and pushes
-    // WsEvent::Devices on every change.
+    let sessions = SessionManager::new(paths.clone(), config.clone(), channels.clone());
     let device_state: DeviceState = Arc::new(std::sync::RwLock::new(Discovery {
         devices: Vec::new(),
         warnings: Vec::new(),
     }));
-    monitor::spawn(paths.clone(), device_state.clone(), sessions.subscribe_sender());
+    monitor::spawn(paths.clone(), device_state.clone(), sessions.sender());
 
     let state = AppState {
         paths,
         config,
         sessions,
         device_state,
-        satellites,
-        ref_tps,
-        ref_caps,
+        satellites: Arc::new(RwLock::new(SatelliteDb::load())),
+        ref_tps: Arc::new(RwLock::new(ReferenceTpDb::load())),
+        ref_caps: Arc::new(RwLock::new(ReferenceCaptureDb::load())),
         channels,
     };
 
     let app = Router::new()
-        .route("/", get(index))
-        .route("/hls.js", get(hls_js))
+        .route("/", get(|| async { Html(INDEX_HTML) }))
+        .route("/static/*path", get(static_file))
         .route("/api/health", get(health))
         .route("/api/devices", get(api_devices))
-        .route("/api/transponders", get(api_transponders))
         .route("/api/config", get(api_config_get).post(api_config_set))
         .route("/api/analyze", get(api_analyze))
         .route("/api/captures", get(api_captures))
-        .route(
-            "/api/satellites",
-            get(api_satellites_get).post(api_satellites_upsert),
-        )
+        .route("/api/playout/suggest", get(api_playout_suggest))
+        .route("/api/satellites", get(api_satellites_get).post(api_satellites_upsert))
         .route("/api/satellites/import", post(api_satellites_import))
-        .route("/api/satellites/:name", axum::routing::delete(api_satellites_delete))
-        .route(
-            "/api/reference-transponders",
-            get(api_ref_tps_get).post(api_ref_tps_add),
-        )
-        .route(
-            "/api/reference-transponders/:index",
-            axum::routing::delete(api_ref_tps_delete),
-        )
-        .route(
-            "/api/reference-captures",
-            get(api_ref_caps_get).post(api_ref_caps_upsert),
-        )
-        .route(
-            "/api/reference-captures/:name",
-            axum::routing::delete(api_ref_caps_delete),
-        )
-        .route("/api/channels", get(api_channels_get).post(api_channels_save))
-        .route(
-            "/api/channels/:id",
-            axum::routing::delete(api_channels_delete),
-        )
-        .route("/api/session/status", get(api_session_status))
-        .route("/api/session/tune", post(api_session_tune).delete(api_session_tune_stop))
-        .route("/api/session/capture", post(api_session_capture).delete(api_session_capture_stop))
-        .route(
-            "/api/session/capture-sat",
-            post(api_session_capture_sat).delete(api_session_capture_sat_stop),
-        )
-        .route("/api/session/scan", post(api_session_scan).delete(api_session_scan_stop))
-        .route("/api/session/play", post(api_session_play).delete(api_session_play_stop))
-        .route(
-            "/api/session/playout",
-            post(api_session_playout).delete(api_session_playout_stop),
-        )
+        .route("/api/satellites/:name", delete(api_satellites_delete))
+        .route("/api/reference-transponders", get(api_ref_tps_get).post(api_ref_tps_add))
+        .route("/api/reference-transponders/:index", delete(api_ref_tps_delete))
+        .route("/api/reference-captures", get(api_ref_caps_get).post(api_ref_caps_upsert))
+        .route("/api/reference-captures/:name", delete(api_ref_caps_delete))
+        .route("/api/channels", get(api_channels_get).delete(api_channels_clear))
+        .route("/api/channels/:id", delete(api_channels_delete))
+        .route("/api/session/status", get(api_status))
+        .route("/api/session/tuner", delete(api_tuner_stop))
+        .route("/api/session/monitor", post(api_monitor))
+        .route("/api/session/capture", post(api_capture))
+        .route("/api/session/scan", post(api_scan))
+        .route("/api/session/play", post(api_play))
+        .route("/api/session/playout", post(api_playout).delete(api_playout_stop))
         .route("/hls/*path", get(hls_file))
         .route("/ws", get(ws_upgrade))
-        .with_state(state);
+        .with_state(state.clone());
 
     let addr = format!("{bind}:{port}");
     let listener = tokio::net::TcpListener::bind(&addr).await?;
-    println!("dvbhub web interface listening on http://{addr}");
-    println!("(press Ctrl-C to stop)");
-
+    println!("dvbhub web interface listening on http://{addr}  (Ctrl-C to stop)");
     axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(async {
+            let _ = tokio::signal::ctrl_c().await;
+        })
         .await?;
+    println!("\nshutting down: stopping tuner and playout jobs");
+    state.sessions.stop_tuner().await;
+    state.sessions.stop_playout().await;
     Ok(())
 }
 
-/// Resolves when the process receives Ctrl-C, for graceful shutdown.
-async fn shutdown_signal() {
-    let _ = tokio::signal::ctrl_c().await;
-    println!("\nshutting down dvbhub web interface");
+// ---- helpers ------------------------------------------------------------
+
+/// JSON error response.
+fn error_json(status: StatusCode, message: &str) -> Response {
+    (status, Json(json!({ "ok": false, "error": message }))).into_response()
 }
 
-/// Serves the embedded UI page.
-async fn index() -> Html<&'static str> {
-    Html(INDEX_HTML)
+fn bad_request(e: impl std::fmt::Display) -> Response {
+    error_json(StatusCode::BAD_REQUEST, &e.to_string())
 }
 
-/// Serves the bundled hls.js library (so the UI needs no internet access).
-async fn hls_js() -> Response {
-    (
-        [(header::CONTENT_TYPE, "application/javascript")],
-        HLS_JS,
-    )
-        .into_response()
+fn ok() -> Response {
+    Json(json!({ "ok": true })).into_response()
 }
 
-/// Lightweight health/version probe used by the UI to show connection status.
+fn discovery(state: &AppState) -> Discovery {
+    state.device_state.read().map(|d| d.clone()).unwrap_or(Discovery {
+        devices: Vec::new(),
+        warnings: Vec::new(),
+    })
+}
+
+fn parse_category(s: &str) -> anyhow::Result<DeliveryCategory> {
+    match s.to_ascii_lowercase().as_str() {
+        "satellite" | "sat" | "s" => Ok(DeliveryCategory::Satellite),
+        "terrestrial" | "ter" | "t" => Ok(DeliveryCategory::Terrestrial),
+        "cable" | "cab" | "c" => Ok(DeliveryCategory::Cable),
+        other => anyhow::bail!("unknown delivery {other:?} (satellite / terrestrial / cable)"),
+    }
+}
+
+/// Picks the tuner for `cat`: the requested device (by address) or the best match.
+/// Returns `(capture address, device label)`.
+fn resolve_tuner(
+    state: &AppState,
+    cat: DeliveryCategory,
+    device_name: Option<&str>,
+    model: Option<&str>,
+) -> anyhow::Result<(String, String)> {
+    let disc = discovery(state);
+    let dev: Option<&DvbDevice> = match device_name.filter(|d| !d.is_empty()) {
+        Some(addr) => disc
+            .devices
+            .iter()
+            .find(|d| d.address == addr || d.capture_address(cat) == addr),
+        None => disc.tuner_for(cat, model),
+    };
+    let dev = dev.ok_or_else(|| anyhow::anyhow!("no {} tuner available", cat.as_str()))?;
+    anyhow::ensure!(
+        dev.supports_category(cat),
+        "{} does not support {}",
+        dev.label,
+        cat.as_str()
+    );
+    Ok((dev.capture_address(cat), dev.label.clone()))
+}
+
+/// Persists a JSON database off the async runtime (best effort, logged).
+fn persist(what: &'static str, f: impl FnOnce() -> std::io::Result<()> + Send + 'static) {
+    tokio::task::spawn_blocking(move || {
+        if let Err(e) = f() {
+            lastlog::event("web.error", &format!("saving {what} failed: {e}"));
+        }
+    });
+}
+
+// ---- static + misc --------------------------------------------------------
+
+async fn static_file(AxumPath(path): AxumPath<String>) -> Response {
+    match STATIC_FILES.iter().find(|(p, _, _)| *p == path) {
+        Some((_, ct, body)) => ([(header::CONTENT_TYPE, *ct)], *body).into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
 async fn health(State(state): State<AppState>) -> Response {
     let paths = state.paths.clone();
     let version = tokio::task::spawn_blocking(move || tsduck::version(&paths))
         .await
         .ok()
         .flatten()
-        .unwrap_or_else(|| "unknown".to_string());
-
-    Json(json!({ "ok": true, "tsduck_version": version })).into_response()
+        .unwrap_or_else(|| "unknown".into());
+    Json(json!({ "ok": true, "tsduck_version": version, "dvbhub_version": env!("CARGO_PKG_VERSION") }))
+        .into_response()
 }
 
-/// Returns the cached device snapshot maintained by the hotplug monitor.
 async fn api_devices(State(state): State<AppState>) -> Response {
-    let discovery = state
-        .device_state
-        .read()
-        .map(|d| d.clone())
-        .unwrap_or_else(|_| Discovery {
-            devices: Vec::new(),
-            warnings: Vec::new(),
-        });
-    Json(discovery).into_response()
+    Json(discovery(&state)).into_response()
 }
 
-/// Returns the fixed reference transponder list.
-async fn api_transponders() -> Response {
-    Json(transponders::REFERENCE_TRANSPONDERS).into_response()
-}
-
-/// Returns the current application config (capture directory, etc.).
 async fn api_config_get(State(state): State<AppState>) -> Response {
     let cfg = state.config.read().await.clone();
     Json(json!({
         "ok": true,
         "capture_dir": cfg.capture_dir.to_string_lossy(),
+        "capture_seconds": cfg.capture_seconds,
         "config_file": crate::config::config_file_path().to_string_lossy(),
         "log_file": crate::config::log_file_path().to_string_lossy(),
+        "hls_dir": session::hls_root().to_string_lossy(),
     }))
     .into_response()
 }
 
-/// Body for updating the application config.
 #[derive(Deserialize)]
 struct ConfigUpdate {
     capture_dir: String,
 }
 
-/// Updates the capture directory and persists the config to disk.
-async fn api_config_set(
-    State(state): State<AppState>,
-    Json(req): Json<ConfigUpdate>,
-) -> Response {
-    let dir = req.capture_dir.trim();
-    if dir.is_empty() {
-        return error_json(StatusCode::BAD_REQUEST, "capture_dir cannot be empty");
+async fn api_config_set(State(state): State<AppState>, Json(req): Json<ConfigUpdate>) -> Response {
+    let dir = AppConfig::expand_path(&req.capture_dir);
+    if req.capture_dir.trim().is_empty() {
+        return bad_request("capture_dir cannot be empty");
     }
-    match state
-        .sessions
-        .set_capture_dir(std::path::PathBuf::from(dir))
-        .await
-    {
-        Ok(cfg) => Json(json!({
-            "ok": true,
-            "capture_dir": cfg.capture_dir.to_string_lossy(),
-        }))
-        .into_response(),
-        Err(e) => error_json(StatusCode::BAD_REQUEST, &e.to_string()),
+    match state.sessions.set_capture_dir(dir).await {
+        Ok(cfg) => Json(json!({ "ok": true, "capture_dir": cfg.capture_dir.to_string_lossy() }))
+            .into_response(),
+        Err(e) => bad_request(e),
     }
 }
 
-/// Query parameters for `/api/analyze`.
 #[derive(Deserialize)]
-struct AnalyzeQuery {
+struct FileQuery {
     file: String,
 }
 
-/// Analyzes a transport-stream file (TS id, bitrate, service list).
-async fn api_analyze(
-    State(state): State<AppState>,
-    query: Result<Query<AnalyzeQuery>, axum::extract::rejection::QueryRejection>,
-) -> Response {
-    let Query(q) = match query {
-        Ok(q) => q,
-        Err(_) => return error_json(StatusCode::BAD_REQUEST, "missing ?file=<path>"),
-    };
+async fn api_analyze(State(state): State<AppState>, Query(q): Query<FileQuery>) -> Response {
+    let path = state.config.read().await.resolve_output(&q.file);
     let paths = state.paths.clone();
-    let file = q.file.clone();
+    let file = path.to_string_lossy().into_owned();
     match tokio::task::spawn_blocking(move || analyze::analyze_file(&paths, &file)).await {
         Ok(Ok(summary)) => Json(summary).into_response(),
         Ok(Err(e)) => error_json(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
@@ -289,506 +280,634 @@ async fn api_analyze(
     }
 }
 
-async fn api_session_status(State(state): State<AppState>) -> Response {
-    Json(state.sessions.status().await).into_response()
+/// Lists `.ts` files under the capture dir (newest first) with sidecar info.
+async fn api_captures(State(state): State<AppState>) -> Response {
+    let root = state.config.read().await.capture_dir.clone();
+    let files = tokio::task::spawn_blocking(move || {
+        let mut out = Vec::new();
+        collect_ts(&root, &root, 0, &mut out);
+        out.sort_by(|a, b| b.2.cmp(&a.2));
+        out.into_iter()
+            .map(|(rel, size, mtime, sidecar)| {
+                json!({ "file": rel, "size": size, "mtime": mtime, "sidecar": sidecar })
+            })
+            .collect::<Vec<_>>()
+    })
+    .await
+    .unwrap_or_default();
+    Json(json!({ "ok": true, "files": files })).into_response()
 }
 
-async fn api_session_tune(
-    State(state): State<AppState>,
-    Json(req): Json<TuneRequest>,
-) -> Response {
-    match state.sessions.clone().start_tune(req).await {
-        Ok(()) => Json(json!({ "ok": true })).into_response(),
-        Err(e) => error_json(StatusCode::BAD_REQUEST, &e.to_string()),
+fn collect_ts(
+    root: &std::path::Path,
+    dir: &std::path::Path,
+    depth: usize,
+    out: &mut Vec<(String, u64, u64, bool)>,
+) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            if depth < 3 {
+                collect_ts(root, &path, depth + 1, out);
+            }
+        } else if path.extension().is_some_and(|e| e == "ts") {
+            let meta = entry.metadata().ok();
+            let size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+            let mtime = meta
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let sidecar = analyze::services_json_path_for_ts(&path).is_file();
+            if let Ok(rel) = path.strip_prefix(root) {
+                out.push((rel.to_string_lossy().into_owned(), size, mtime, sidecar));
+            }
+        }
     }
 }
 
-async fn api_session_tune_stop(State(state): State<AppState>) -> Response {
-    state.sessions.stop_tune().await;
-    Json(json!({ "ok": true })).into_response()
-}
-
-async fn api_session_capture(
-    State(state): State<AppState>,
-    Json(req): Json<CaptureStartRequest>,
-) -> Response {
-    match state.sessions.clone().start_capture(req).await {
-        Ok(()) => Json(json!({ "ok": true })).into_response(),
-        Err(e) => error_json(StatusCode::BAD_REQUEST, &e.to_string()),
+/// Playout form values derived from a capture's `_services.json` sidecar.
+async fn api_playout_suggest(State(state): State<AppState>, Query(q): Query<FileQuery>) -> Response {
+    let path = state.config.read().await.resolve_output(&q.file);
+    let sidecar = analyze::services_json_path_for_ts(&path);
+    match CaptureServicesRecord::read_file(&sidecar)
+        .and_then(|rec| ReferenceCapture::from_tune(q.file.clone(), &rec.tune).map(|f| (rec, f)))
+    {
+        Ok((rec, form)) => Json(json!({ "ok": true, "form": form, "tune": rec.tune })).into_response(),
+        Err(e) => error_json(StatusCode::NOT_FOUND, &format!("no usable sidecar: {e:#}")),
     }
 }
 
-async fn api_session_capture_stop(State(state): State<AppState>) -> Response {
-    let path = state.sessions.stop_capture().await;
-    Json(json!({ "ok": true, "output": path })).into_response()
-}
+// ---- satellites / reference databases --------------------------------------
 
-async fn api_session_scan(
-    State(state): State<AppState>,
-    Json(req): Json<TuneRequest>,
-) -> Response {
-    match state.sessions.clone().start_nit_scan(req).await {
-        Ok(()) => Json(json!({ "ok": true })).into_response(),
-        Err(e) => error_json(StatusCode::BAD_REQUEST, &e.to_string()),
-    }
-}
-
-async fn api_session_scan_stop(State(state): State<AppState>) -> Response {
-    state.sessions.stop_scan().await;
-    Json(json!({ "ok": true })).into_response()
-}
-
-async fn api_session_play(
-    State(state): State<AppState>,
-    Json(req): Json<PlayStartRequest>,
-) -> Response {
-    match state.sessions.clone().start_play(req).await {
-        Ok(hls_url) => Json(json!({ "ok": true, "hls_url": hls_url })).into_response(),
-        Err(e) => error_json(StatusCode::BAD_REQUEST, &e.to_string()),
-    }
-}
-
-async fn api_session_play_stop(State(state): State<AppState>) -> Response {
-    state.sessions.stop_play().await;
-    Json(json!({ "ok": true })).into_response()
-}
-
-// ---- Satellite database -------------------------------------------------
-
-/// Returns the satellite catalogue.
 async fn api_satellites_get(State(state): State<AppState>) -> Response {
-    let db = state.satellites.read().await.clone();
-    Json(db).into_response()
+    Json(state.satellites.read().await.clone()).into_response()
 }
 
-/// Adds or replaces a satellite (matched by name), then persists.
-async fn api_satellites_upsert(
-    State(state): State<AppState>,
-    Json(sat): Json<Satellite>,
-) -> Response {
+async fn api_satellites_upsert(State(state): State<AppState>, Json(sat): Json<Satellite>) -> Response {
     if sat.name.trim().is_empty() {
-        return error_json(StatusCode::BAD_REQUEST, "satellite name is required");
+        return bad_request("satellite name is required");
     }
     let db = {
         let mut db = state.satellites.write().await;
         db.upsert(sat);
         db.clone()
     };
-    persist_satellites(&db);
-    Json(json!({ "ok": true })).into_response()
+    persist("satellites", move || db.save());
+    ok()
 }
 
-/// Deletes a satellite by name.
-async fn api_satellites_delete(
-    State(state): State<AppState>,
-    AxumPath(name): AxumPath<String>,
-) -> Response {
+async fn api_satellites_delete(State(state): State<AppState>, AxumPath(name): AxumPath<String>) -> Response {
     let (removed, db) = {
         let mut db = state.satellites.write().await;
-        let removed = db.remove(&name);
-        (removed, db.clone())
+        (db.remove(&name), db.clone())
     };
-    if removed {
-        persist_satellites(&db);
-        Json(json!({ "ok": true })).into_response()
-    } else {
-        error_json(StatusCode::NOT_FOUND, "satellite not found")
+    if !removed {
+        return error_json(StatusCode::NOT_FOUND, "satellite not found");
     }
+    persist("satellites", move || db.save());
+    ok()
 }
 
-/// Body for a KingOfSat import request.
 #[derive(Deserialize)]
 struct ImportBody {
     /// KingOfSat position code, e.g. "42E", "13E", "19.2E".
     pos: String,
-    /// Optional satellite name to store (defaults to the KingOfSat label).
     name: Option<String>,
-    /// Optional longitude label (defaults to `pos`).
     longitude: Option<String>,
 }
 
-/// Imports a satellite live from KingOfSat and stores it in the catalogue.
-async fn api_satellites_import(
-    State(state): State<AppState>,
-    Json(req): Json<ImportBody>,
-) -> Response {
+async fn api_satellites_import(State(state): State<AppState>, Json(req): Json<ImportBody>) -> Response {
     let pos = req.pos.trim().to_string();
     if pos.is_empty() {
-        return error_json(StatusCode::BAD_REQUEST, "pos is required (e.g. 42E)");
+        return bad_request("pos is required (e.g. 42E)");
     }
-    let pos_for_fetch = pos.clone();
-    let fetched =
-        tokio::task::spawn_blocking(move || crate::satellites::fetch_position(&pos_for_fetch))
-            .await;
-    let (label, tps) = match fetched {
-        Ok(Ok(v)) => v,
-        Ok(Err(e)) => return error_json(StatusCode::BAD_GATEWAY, &e.to_string()),
-        Err(e) => return error_json(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
-    };
-    let name = req.name.unwrap_or_else(|| label.clone());
-    let longitude = req.longitude.unwrap_or_else(|| pos.clone());
+    let fetch_pos = pos.clone();
+    let (label, tps) =
+        match tokio::task::spawn_blocking(move || crate::satellites::fetch_position(&fetch_pos)).await {
+            Ok(Ok(v)) => v,
+            Ok(Err(e)) => return error_json(StatusCode::BAD_GATEWAY, &e.to_string()),
+            Err(e) => return error_json(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+        };
+    let name = req.name.unwrap_or(label);
     let count = tps.len();
-    let sat = Satellite {
-        name: name.clone(),
-        longitude,
-        lnb: "universal".to_string(),
-        diseqc: 0,
-        transponders: tps,
-    };
     let db = {
         let mut db = state.satellites.write().await;
-        // Preserve LNB/DiSEqC if the satellite already exists.
-        if let Some(i) = db.index_of(&name) {
-            let mut sat = sat;
-            sat.lnb = db.satellites[i].lnb.clone();
-            sat.diseqc = db.satellites[i].diseqc;
-            db.satellites[i] = sat;
-        } else {
-            db.upsert(sat);
-        }
+        // Keep the user's LNB / DiSEqC settings when refreshing a known satellite.
+        let (lnb, diseqc) = db
+            .index_of(&name)
+            .map(|i| (db.satellites[i].lnb.clone(), db.satellites[i].diseqc))
+            .unwrap_or(("universal".into(), 0));
+        db.upsert(Satellite {
+            name: name.clone(),
+            longitude: req.longitude.unwrap_or_else(|| pos.clone()),
+            lnb,
+            diseqc,
+            transponders: tps,
+        });
         db.clone()
     };
-    persist_satellites(&db);
+    persist("satellites", move || db.save());
     Json(json!({ "ok": true, "name": name, "transponders": count })).into_response()
 }
 
-/// Persists the satellite DB off-thread (best effort).
-fn persist_satellites(db: &SatelliteDb) {
-    let db = db.clone();
-    tokio::task::spawn_blocking(move || {
-        let _ = db.save();
-    });
-}
-
-// ---- Reference transponders --------------------------------------------
-
 async fn api_ref_tps_get(State(state): State<AppState>) -> Response {
-    let db = state.ref_tps.read().await.clone();
-    Json(db).into_response()
+    Json(state.ref_tps.read().await.clone()).into_response()
 }
 
-async fn api_ref_tps_add(
-    State(state): State<AppState>,
-    Json(tp): Json<SatTransponder>,
-) -> Response {
+async fn api_ref_tps_add(State(state): State<AppState>, Json(tp): Json<SatTransponder>) -> Response {
+    if tp.frequency_mhz == 0 || tp.symbol_rate_ksps == 0 {
+        return bad_request("frequency and symbol rate are required");
+    }
     let db = {
         let mut db = state.ref_tps.write().await;
         db.add(tp);
         db.clone()
     };
-    let to_save = db.clone();
-    tokio::task::spawn_blocking(move || {
-        let _ = to_save.save();
-    });
-    Json(json!({ "ok": true, "count": db.transponders.len() })).into_response()
+    let count = db.transponders.len();
+    persist("reference transponders", move || db.save());
+    Json(json!({ "ok": true, "count": count })).into_response()
 }
 
-async fn api_ref_tps_delete(
-    State(state): State<AppState>,
-    AxumPath(index): AxumPath<usize>,
-) -> Response {
-    let (ok, db) = {
+async fn api_ref_tps_delete(State(state): State<AppState>, AxumPath(index): AxumPath<usize>) -> Response {
+    let (removed, db) = {
         let mut db = state.ref_tps.write().await;
-        let ok = db.remove(index);
-        (ok, db.clone())
+        (db.remove(index), db.clone())
     };
-    if ok {
-        let to_save = db.clone();
-        tokio::task::spawn_blocking(move || {
-            let _ = to_save.save();
-        });
-        Json(json!({ "ok": true })).into_response()
-    } else {
-        error_json(StatusCode::NOT_FOUND, "transponder index out of range")
+    if !removed {
+        return error_json(StatusCode::NOT_FOUND, "transponder index out of range");
     }
+    persist("reference transponders", move || db.save());
+    ok()
 }
-
-// ---- Reference captures -------------------------------------------------
 
 async fn api_ref_caps_get(State(state): State<AppState>) -> Response {
-    let db = state.ref_caps.read().await.clone();
-    Json(db).into_response()
+    Json(state.ref_caps.read().await.clone()).into_response()
 }
 
-async fn api_ref_caps_upsert(
-    State(state): State<AppState>,
-    Json(cap): Json<ReferenceCapture>,
-) -> Response {
-    if cap.name.trim().is_empty() {
-        return error_json(StatusCode::BAD_REQUEST, "capture name is required");
+async fn api_ref_caps_upsert(State(state): State<AppState>, Json(cap): Json<ReferenceCapture>) -> Response {
+    if cap.name.trim().is_empty() || cap.file.trim().is_empty() {
+        return bad_request("name and file are required");
     }
     let db = {
         let mut db = state.ref_caps.write().await;
         db.upsert(cap);
         db.clone()
     };
-    let to_save = db.clone();
-    tokio::task::spawn_blocking(move || {
-        let _ = to_save.save();
-    });
-    Json(json!({ "ok": true })).into_response()
+    persist("reference captures", move || db.save());
+    ok()
 }
 
-async fn api_ref_caps_delete(
-    State(state): State<AppState>,
-    AxumPath(name): AxumPath<String>,
-) -> Response {
-    let (ok, db) = {
+async fn api_ref_caps_delete(State(state): State<AppState>, AxumPath(name): AxumPath<String>) -> Response {
+    let (removed, db) = {
         let mut db = state.ref_caps.write().await;
-        let ok = db.remove(&name);
-        (ok, db.clone())
+        (db.remove(&name), db.clone())
     };
-    if ok {
-        let to_save = db.clone();
-        tokio::task::spawn_blocking(move || {
-            let _ = to_save.save();
-        });
-        Json(json!({ "ok": true })).into_response()
-    } else {
-        error_json(StatusCode::NOT_FOUND, "capture not found")
+    if !removed {
+        return error_json(StatusCode::NOT_FOUND, "capture not found");
     }
+    persist("reference captures", move || db.save());
+    ok()
 }
 
-// ---- Saved TV channels -------------------------------------------------
+// ---- channels ---------------------------------------------------------------
 
 async fn api_channels_get(State(state): State<AppState>) -> Response {
-    let db = state.channels.read().await.clone();
-    Json(db).into_response()
+    Json(state.channels.read().await.clone()).into_response()
+}
+
+async fn api_channels_delete(State(state): State<AppState>, AxumPath(id): AxumPath<u64>) -> Response {
+    let (removed, db) = {
+        let mut db = state.channels.write().await;
+        (db.remove(id), db.clone())
+    };
+    if !removed {
+        return error_json(StatusCode::NOT_FOUND, "channel not found");
+    }
+    persist("channels", move || db.save());
+    ok()
 }
 
 #[derive(Deserialize)]
-struct SaveChannelsBody {
+struct ClearQuery {
     delivery: String,
-    tune: TuneRequest,
+    /// Only channels of this satellite (satellite delivery); "-" = channels without one.
+    satellite: Option<String>,
+}
+
+async fn api_channels_clear(State(state): State<AppState>, Query(q): Query<ClearQuery>) -> Response {
+    let delivery = match parse_category(&q.delivery) {
+        Ok(DeliveryCategory::Satellite) => ChannelDelivery::Satellite,
+        Ok(DeliveryCategory::Terrestrial) => ChannelDelivery::Terrestrial,
+        Ok(DeliveryCategory::Cable) => ChannelDelivery::Cable,
+        Err(e) => return bad_request(e),
+    };
+    let (removed, db) = {
+        let mut db = state.channels.write().await;
+        let before = db.channels.len();
+        db.channels.retain(|c| {
+            let sat_match = match q.satellite.as_deref() {
+                None => true,
+                Some("-") => c.satellite.is_none(),
+                Some(s) => c.satellite.as_deref() == Some(s),
+            };
+            !(c.delivery == delivery && sat_match)
+        });
+        (before - db.channels.len(), db.clone())
+    };
+    persist("channels", move || db.save());
+    Json(json!({ "ok": true, "removed": removed })).into_response()
+}
+
+// ---- session jobs -------------------------------------------------------------
+
+async fn api_status(State(state): State<AppState>) -> Response {
+    Json(state.sessions.status().await).into_response()
+}
+
+async fn api_tuner_stop(State(state): State<AppState>) -> Response {
+    state.sessions.stop_tuner().await;
+    ok()
+}
+
+/// Tuning fields shared by monitor / manual play.
+#[derive(Debug, Default, Deserialize)]
+struct TuneSpec {
+    delivery: String,
+    device_name: Option<String>,
+    /// Catalogue satellite: supplies LNB / DiSEqC unless overridden.
+    satellite: Option<String>,
+    frequency_mhz: u32,
+    delivery_system: Option<String>,
+    polarity: Option<String>,
+    symbol_rate_ksps: Option<u32>,
+    modulation: Option<String>,
+    fec: Option<String>,
+    lnb: Option<String>,
+    diseqc: Option<u32>,
+    bandwidth_mhz: Option<u8>,
+    plp: Option<u8>,
+}
+
+/// Builds tuning parameters (with tuner, LNB and DiSEqC resolved) from a spec.
+async fn tune_params(state: &AppState, t: &TuneSpec) -> anyhow::Result<CaptureParams> {
+    let cat = parse_category(&t.delivery)?;
+    anyhow::ensure!(t.frequency_mhz > 0, "frequency_mhz is required");
+    let (device, _) = resolve_tuner(state, cat, t.device_name.as_deref(), None)?;
+    let sat = match &t.satellite {
+        Some(name) => {
+            let db = state.satellites.read().await;
+            db.index_of(name).map(|i| db.satellites[i].clone())
+        }
+        None => None,
+    };
+    let is_sat = cat == DeliveryCategory::Satellite;
+    Ok(CaptureParams {
+        device_name: Some(device),
+        adapter: None,
+        delivery_system: t.delivery_system.clone().unwrap_or_else(|| {
+            match cat {
+                DeliveryCategory::Satellite => "DVB-S2",
+                DeliveryCategory::Terrestrial => "DVB-T2",
+                DeliveryCategory::Cable => "DVB-C",
+            }
+            .into()
+        }),
+        frequency_hz: u64::from(t.frequency_mhz) * 1_000_000,
+        polarity: t.polarity.clone().filter(|_| is_sat),
+        symbol_rate: t.symbol_rate_ksps.map(|s| u64::from(s) * 1_000),
+        modulation: t.modulation.clone(),
+        fec: t.fec.clone().filter(|_| is_sat),
+        lnb: is_sat.then(|| {
+            t.lnb
+                .as_deref()
+                .map(tsp_lnb_value)
+                .or_else(|| sat.as_ref().map(|s| s.tsp_lnb()))
+                .unwrap_or_else(|| "Extended".into())
+        }),
+        satellite_number: is_sat.then(|| t.diseqc.or(sat.as_ref().map(|s| s.diseqc)).unwrap_or(0)),
+        bandwidth_hz: t
+            .bandwidth_mhz
+            .filter(|_| cat == DeliveryCategory::Terrestrial)
+            .map(|b| u64::from(b) * 1_000_000),
+        guard_interval: None,
+        plp: t.plp,
+        dvb_status_interval_s: None,
+        signal_timeout_s: 10,
+        seconds: 0,
+        output: String::new(),
+        live_analyze: false,
+    })
+}
+
+async fn api_monitor(State(state): State<AppState>, Json(t): Json<TuneSpec>) -> Response {
+    let params = match tune_params(&state, &t).await {
+        Ok(p) => p,
+        Err(e) => return bad_request(e),
+    };
+    match state.sessions.start_monitor(params).await {
+        Ok(()) => ok(),
+        Err(e) => bad_request(e),
+    }
+}
+
+/// Body of `POST /api/session/capture`.
+#[derive(Debug, Deserialize)]
+struct CaptureBody {
+    delivery: String,
+    device_name: Option<String>,
+    /// Seconds per target (default: the configured capture length).
+    seconds: Option<u32>,
+    /// Satellite: catalogue name, or the file-name prefix for a manual TP.
+    satellite: Option<String>,
+    /// Satellite TPs to record; omitted = every TP of the catalogue satellite.
+    tps: Option<Vec<SatTransponder>>,
+    lnb: Option<String>,
+    diseqc: Option<u32>,
+    // Terrestrial / cable mux.
+    frequency_mhz: Option<u32>,
+    delivery_system: Option<String>,
+    bandwidth_mhz: Option<u8>,
+    modulation: Option<String>,
+    symbol_rate_ksps: Option<u32>,
+    plp: Option<u8>,
+    guard_interval: Option<String>,
+}
+
+async fn api_capture(State(state): State<AppState>, Json(b): Json<CaptureBody>) -> Response {
+    match capture_job(&state, b).await {
+        Ok(job) => match state.sessions.start_capture(job).await {
+            Ok(()) => ok(),
+            Err(e) => bad_request(e),
+        },
+        Err(e) => bad_request(e),
+    }
+}
+
+async fn capture_job(state: &AppState, b: CaptureBody) -> anyhow::Result<CaptureJob> {
+    let cat = parse_category(&b.delivery)?;
+    let (device, _) = resolve_tuner(state, cat, b.device_name.as_deref(), None)?;
+    let seconds = match b.seconds {
+        Some(s) if s > 0 => s,
+        _ => state.config.read().await.capture_seconds,
+    };
+    match cat {
+        DeliveryCategory::Satellite => {
+            let name = b.satellite.clone().unwrap_or_else(|| "manual".into());
+            let known = {
+                let db = state.satellites.read().await;
+                db.index_of(&name).map(|i| db.satellites[i].clone())
+            };
+            let mut sat = known.unwrap_or(Satellite {
+                name,
+                longitude: String::new(),
+                lnb: "universal".into(),
+                diseqc: 0,
+                transponders: Vec::new(),
+            });
+            if let Some(tps) = b.tps {
+                sat.transponders = tps;
+            }
+            if let Some(l) = b.lnb.filter(|l| !l.is_empty()) {
+                sat.lnb = l;
+            }
+            if let Some(d) = b.diseqc {
+                sat.diseqc = d;
+            }
+            anyhow::ensure!(!sat.transponders.is_empty(), "no transponders to capture");
+            Ok(CaptureJob::Satellite { satellite: sat, device, seconds })
+        }
+        DeliveryCategory::Terrestrial => {
+            let mhz = b.frequency_mhz.ok_or_else(|| anyhow::anyhow!("frequency_mhz is required"))?;
+            Ok(CaptureJob::Terrestrial {
+                mux: TerrestrialMux {
+                    label: format!("{mhz} MHz"),
+                    location: String::new(),
+                    uhf_channel: (21..=69u8)
+                        .find(|&c| channel_scan::uhf_channel_mhz(c) == Some(mhz)),
+                    frequency_mhz: mhz,
+                    delivery_system: b.delivery_system.unwrap_or_else(|| "DVB-T2".into()),
+                    bandwidth_mhz: b.bandwidth_mhz.unwrap_or(8),
+                    guard_interval: b.guard_interval.unwrap_or_else(|| "auto".into()),
+                    modulation: b.modulation.filter(|m| !m.is_empty()),
+                    fec: None,
+                    plp: b.plp,
+                    source: "web".into(),
+                },
+                device,
+                seconds,
+            })
+        }
+        DeliveryCategory::Cable => {
+            let mhz = b.frequency_mhz.ok_or_else(|| anyhow::anyhow!("frequency_mhz is required"))?;
+            let sr = b.symbol_rate_ksps.unwrap_or(6875);
+            Ok(CaptureJob::Cable {
+                mux: CableMux {
+                    label: format!("{mhz} MHz {sr}"),
+                    location: String::new(),
+                    frequency_mhz: mhz,
+                    symbol_rate_ksps: sr,
+                    delivery_system: b.delivery_system.unwrap_or_else(|| "DVB-C".into()),
+                    modulation: b.modulation.unwrap_or_else(|| "256-QAM".into()),
+                    fec: None,
+                    source: "web".into(),
+                },
+                device,
+                seconds,
+            })
+        }
+    }
+}
+
+/// Body of `POST /api/session/scan`.
+#[derive(Debug, Deserialize)]
+struct ScanBody {
+    delivery: String,
+    device_name: Option<String>,
+    satellite: Option<String>,
+    /// Satellite TP filter ("10719v", "10930"); empty = all.
+    #[serde(default)]
+    tps: Vec<String>,
+    /// Terrestrial / cable frequencies (terrestrial: empty = UHF 21-69).
+    #[serde(default)]
+    frequencies_mhz: Vec<u32>,
+    bandwidth_mhz: Option<u8>,
+    symbol_rate_ksps: Option<u32>,
+    modulation: Option<String>,
+    listen_s: Option<u32>,
+    #[serde(default = "yes")]
+    include_radio: bool,
+    #[serde(default)]
+    include_scrambled: bool,
+    #[serde(default = "yes")]
+    save: bool,
     #[serde(default)]
     replace: bool,
 }
 
-fn parse_delivery(s: &str) -> Option<ChannelDelivery> {
-    match s.to_ascii_lowercase().as_str() {
-        "satellite" | "sat" | "s" => Some(ChannelDelivery::Satellite),
-        "terrestrial" | "terr" | "t" => Some(ChannelDelivery::Terrestrial),
-        "cable" | "c" => Some(ChannelDelivery::Cable),
-        _ => None,
-    }
+fn yes() -> bool {
+    true
 }
 
-/// Saves FTA services from the current session (after tune) into the catalogue.
-async fn api_channels_save(
-    State(state): State<AppState>,
-    Json(req): Json<SaveChannelsBody>,
-) -> Response {
-    let delivery = match parse_delivery(&req.delivery) {
-        Some(d) => d,
-        None => return error_json(StatusCode::BAD_REQUEST, "delivery must be satellite, terrestrial, or cable"),
-    };
-
-    let services = state.sessions.status().await.services;
-    if services.is_empty() {
-        return error_json(
-            StatusCode::BAD_REQUEST,
-            "no services in session — lock a transponder first",
-        );
-    }
-
-    let mut base_index = {
-        let db = state.channels.read().await;
-        db.for_delivery(&delivery)
-            .iter()
-            .map(|c| c.scan_index)
-            .max()
-            .unwrap_or(0)
-            .saturating_add(1)
-    };
-
-    if req.replace {
-        let mut db = state.channels.write().await;
-        db.clear_delivery(&delivery);
-        base_index = 0;
-    }
-
-    let mut batch = Vec::new();
-    for svc in services.iter().filter(|s| !s.scrambled) {
-        batch.push(SavedChannel {
-            id: 0,
-            delivery: delivery.clone(),
-            name: svc.name.clone(),
-            service_id: svc.id,
-            provider: svc.provider.clone(),
-            scrambled: svc.scrambled,
-            scan_index: base_index,
-            device_name: req.tune.device_name.clone(),
-            delivery_system: req.tune.delivery_system.clone(),
-            frequency_mhz: req.tune.frequency_mhz,
-            polarity: req.tune.polarity.clone(),
-            symbol_rate_ksps: req.tune.symbol_rate_ksps,
-            modulation: req.tune.modulation.clone(),
-            fec: req.tune.fec.clone(),
-            satellite_number: req.tune.satellite_number,
-            bandwidth_mhz: None,
-            guard_interval: None,
-            plp: None,
-        });
-        base_index += 1;
-    }
-
-    if batch.is_empty() {
-        return error_json(StatusCode::BAD_REQUEST, "no FTA services to save");
-    }
-
-    let (added, db) = {
-        let mut db = state.channels.write().await;
-        let added = db.add_batch(batch);
-        (added, db.clone())
-    };
-    persist_channels(&db);
-    Json(json!({ "ok": true, "added": added, "total": db.channels.len() })).into_response()
-}
-
-async fn api_channels_delete(
-    State(state): State<AppState>,
-    AxumPath(id): AxumPath<u64>,
-) -> Response {
-    let (ok, db) = {
-        let mut db = state.channels.write().await;
-        let ok = db.remove(id);
-        (ok, db.clone())
-    };
-    if ok {
-        persist_channels(&db);
-        Json(json!({ "ok": true })).into_response()
-    } else {
-        error_json(StatusCode::NOT_FOUND, "channel not found")
-    }
-}
-
-fn persist_channels(db: &ChannelDb) {
-    let db = db.clone();
-    tokio::task::spawn_blocking(move || {
-        let _ = db.save();
-    });
-}
-
-/// Lists transport-stream files available under the capture directory.
-async fn api_captures(State(state): State<AppState>) -> Response {
-    let dir = state.config.read().await.capture_dir.clone();
-    let mut files = Vec::new();
-    collect_ts_files(&dir, &dir, &mut files, 0).await;
-    files.sort();
-    Json(json!({ "ok": true, "files": files })).into_response()
-}
-
-/// Recursively collects `.ts` files (up to two directory levels) as paths
-/// relative to `root`.
-fn collect_ts_files<'a>(
-    root: &'a std::path::Path,
-    dir: &'a std::path::Path,
-    out: &'a mut Vec<String>,
-    depth: usize,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
-    Box::pin(async move {
-        let Ok(mut entries) = tokio::fs::read_dir(dir).await else {
-            return;
-        };
-        while let Ok(Some(entry)) = entries.next_entry().await {
-            let path = entry.path();
-            if path.is_dir() {
-                if depth < 1 && path.file_name().and_then(|n| n.to_str()) != Some("hls") {
-                    collect_ts_files(root, &path, out, depth + 1).await;
-                }
-            } else if path.extension().and_then(|e| e.to_str()) == Some("ts") {
-                if let Ok(rel) = path.strip_prefix(root) {
-                    out.push(rel.to_string_lossy().into_owned());
-                }
+async fn api_scan(State(state): State<AppState>, Json(b): Json<ScanBody>) -> Response {
+    let job = async {
+        let cat = parse_category(&b.delivery)?;
+        let (device, model) = resolve_tuner(&state, cat, b.device_name.as_deref(), None)?;
+        let targets = match cat {
+            DeliveryCategory::Satellite => {
+                let name = b.satellite.as_deref().ok_or_else(|| anyhow::anyhow!("satellite is required"))?;
+                let db = state.satellites.read().await;
+                let sat = db
+                    .index_of(name)
+                    .map(|i| &db.satellites[i])
+                    .ok_or_else(|| anyhow::anyhow!("satellite not found: {name}"))?;
+                channel_scan::satellite_targets(sat, &device, Some(&model), &b.tps)
             }
-        }
-    })
-}
-
-// ---- Satellite capture & playout ---------------------------------------
-
-/// Body for a sequential satellite capture.
-#[derive(Deserialize)]
-struct SatCaptureBody {
-    device_name: Option<String>,
-    adapter: Option<u32>,
-    satellite: String,
-    seconds: Option<u32>,
-    signal_timeout_s: Option<u32>,
-}
-
-async fn api_session_capture_sat(
-    State(state): State<AppState>,
-    Json(req): Json<SatCaptureBody>,
-) -> Response {
-    let sat = {
-        let db = state.satellites.read().await;
-        match db.index_of(&req.satellite) {
-            Some(i) => db.satellites[i].clone(),
-            None => return error_json(StatusCode::NOT_FOUND, "satellite not found"),
-        }
-    };
-    let lnb = Some(sat.tsp_lnb());
-    let plan = SatCapturePlan {
-        device_name: req.device_name,
-        adapter: req.adapter,
-        satellite_name: sat.name.clone(),
-        diseqc: sat.diseqc,
-        lnb,
-        seconds: req.seconds.unwrap_or(10),
-        signal_timeout_s: req.signal_timeout_s.unwrap_or(15),
-        transponders: sat.transponders,
-    };
-    match state.sessions.clone().start_sat_capture(plan).await {
-        Ok(()) => Json(json!({ "ok": true })).into_response(),
-        Err(e) => error_json(StatusCode::BAD_REQUEST, &e.to_string()),
+            DeliveryCategory::Terrestrial => channel_scan::terrestrial_targets(
+                &device,
+                Some(&model),
+                &b.frequencies_mhz,
+                b.bandwidth_mhz.unwrap_or(8),
+            ),
+            DeliveryCategory::Cable => {
+                anyhow::ensure!(!b.frequencies_mhz.is_empty(), "cable scan needs frequencies_mhz");
+                channel_scan::cable_targets(
+                    &device,
+                    Some(&model),
+                    &b.frequencies_mhz,
+                    b.symbol_rate_ksps.unwrap_or(6875),
+                    b.modulation.as_deref().unwrap_or("256-QAM"),
+                )
+            }
+        };
+        anyhow::ensure!(!targets.is_empty(), "nothing to scan (check the TP filter)");
+        Ok::<_, anyhow::Error>(ScanJob {
+            device,
+            targets,
+            opts: ScanOptions {
+                listen_secs: b.listen_s.unwrap_or(5),
+                include_radio: b.include_radio,
+                include_scrambled: b.include_scrambled,
+                ..Default::default()
+            },
+            save: b.save,
+            replace: b.replace,
+        })
+    }
+    .await;
+    match job {
+        Ok(job) => match state.sessions.start_scan(job).await {
+            Ok(()) => ok(),
+            Err(e) => bad_request(e),
+        },
+        Err(e) => bad_request(e),
     }
 }
 
-async fn api_session_capture_sat_stop(State(state): State<AppState>) -> Response {
-    state.sessions.clone().stop_sat_capture().await;
-    Json(json!({ "ok": true })).into_response()
+/// Body of `POST /api/session/play`: a saved channel, or a tune + service id.
+#[derive(Debug, Deserialize)]
+struct PlayBody {
+    channel_id: Option<u64>,
+    tune: Option<TuneSpec>,
+    service_id: Option<u64>,
+    name: Option<String>,
 }
 
-async fn api_session_playout(
-    State(state): State<AppState>,
-    Json(req): Json<PlayoutRequest>,
-) -> Response {
-    match state.sessions.clone().start_playout(req).await {
-        Ok(()) => Json(json!({ "ok": true })).into_response(),
-        Err(e) => error_json(StatusCode::BAD_REQUEST, &e.to_string()),
+async fn api_play(State(state): State<AppState>, Json(b): Json<PlayBody>) -> Response {
+    let job = async {
+        if let Some(id) = b.channel_id {
+            let ch = state
+                .channels
+                .read()
+                .await
+                .channels
+                .iter()
+                .find(|c| c.id == id)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("channel {id} not found"))?;
+            let cat = match ch.delivery {
+                ChannelDelivery::Satellite => DeliveryCategory::Satellite,
+                ChannelDelivery::Terrestrial => DeliveryCategory::Terrestrial,
+                ChannelDelivery::Cable => DeliveryCategory::Cable,
+            };
+            let (device, _) = resolve_tuner(&state, cat, None, ch.tuner_model.as_deref())?;
+            let params = ch.to_capture_params(device, 10)?;
+            return Ok::<_, anyhow::Error>(PlayJob {
+                params,
+                service_id: ch.service_id,
+                channel_id: Some(ch.id),
+                name: ch.name,
+            });
+        }
+        let tune = b.tune.as_ref().ok_or_else(|| anyhow::anyhow!("channel_id or tune is required"))?;
+        let sid = b.service_id.ok_or_else(|| anyhow::anyhow!("service_id is required"))?;
+        Ok(PlayJob {
+            params: tune_params(&state, tune).await?,
+            service_id: sid,
+            channel_id: None,
+            name: b.name.clone().unwrap_or_else(|| format!("service {sid}")),
+        })
+    }
+    .await;
+    match job {
+        Ok(job) => match state.sessions.start_play(job).await {
+            Ok(url) => Json(json!({ "ok": true, "hls_url": url })).into_response(),
+            Err(e) => bad_request(e),
+        },
+        Err(e) => bad_request(e),
     }
 }
 
-async fn api_session_playout_stop(State(state): State<AppState>) -> Response {
+async fn api_playout(State(state): State<AppState>, Json(form): Json<ReferenceCapture>) -> Response {
+    let input = state.config.read().await.resolve_output(&form.file);
+    if !input.is_file() {
+        return bad_request(format!("file not found: {}", input.display()));
+    }
+    if !discovery(&state)
+        .devices
+        .iter()
+        .any(|d| d.kind == crate::devices::DeviceKind::Modulator)
+    {
+        return bad_request("no modulator (DTU-315) connected");
+    }
+    match form.to_play_params(input.to_string_lossy().into_owned()) {
+        Ok(params) => match state.sessions.start_playout(params).await {
+            Ok(()) => ok(),
+            Err(e) => bad_request(e),
+        },
+        Err(e) => bad_request(e),
+    }
+}
+
+async fn api_playout_stop(State(state): State<AppState>) -> Response {
     state.sessions.stop_playout().await;
-    Json(json!({ "ok": true })).into_response()
+    ok()
 }
 
-async fn hls_file(
-    State(state): State<AppState>,
-    axum::extract::Path(path): axum::extract::Path<String>,
-) -> Response {
-    // Prevent path traversal; allow nested paths such as s10601/stream.m3u8.
+// ---- HLS + WebSocket -------------------------------------------------------------
+
+async fn hls_file(AxumPath(path): AxumPath<String>) -> Response {
     let rel = std::path::Path::new(path.trim_start_matches('/'));
     if rel
         .components()
-        .any(|c| matches!(c, std::path::Component::ParentDir))
+        .any(|c| !matches!(c, std::path::Component::Normal(_)))
     {
         return StatusCode::BAD_REQUEST.into_response();
     }
-    let hls_dir = state.config.read().await.hls_dir();
-    let file_path = hls_dir.join(rel);
-    match tokio::fs::read(&file_path).await {
+    let file = session::hls_root().join(rel);
+    match tokio::fs::read(&file).await {
         Ok(data) => {
             let ct = if path.ends_with(".m3u8") {
                 "application/vnd.apple.mpegurl"
             } else if path.ends_with(".ts") {
                 "video/mp2t"
             } else {
-                "application/octet-stream"
+                "video/mp4"
             };
-            ([(header::CONTENT_TYPE, ct)], data).into_response()
+            ([(header::CONTENT_TYPE, ct), (header::CACHE_CONTROL, "no-store")], data).into_response()
         }
         Err(_) => StatusCode::NOT_FOUND.into_response(),
     }
@@ -800,55 +919,48 @@ async fn ws_upgrade(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl
 
 async fn handle_ws(mut socket: WebSocket, state: AppState) {
     let mut rx = state.sessions.subscribe();
-    let status = state.sessions.status().await;
-    if send_event(&mut socket, &WsEvent::Status { status }).await.is_err() {
-        return;
-    }
-    // Send the current device snapshot so the UI badge populates on connect.
-    let snapshot = state
-        .device_state
-        .read()
-        .map(|d| d.clone())
-        .unwrap_or_else(|_| Discovery {
-            devices: Vec::new(),
-            warnings: Vec::new(),
-        });
-    if send_event(
-        &mut socket,
-        &WsEvent::Devices {
-            devices: snapshot.devices,
-            warnings: snapshot.warnings,
+    let disc = discovery(&state);
+    let hello = [
+        WsEvent::Status {
+            status: state.sessions.status().await,
         },
-    )
-    .await
-    .is_err()
-    {
-        return;
+        WsEvent::Devices {
+            devices: disc.devices,
+            warnings: disc.warnings,
+        },
+    ];
+    for ev in &hello {
+        if send_event(&mut socket, ev).await.is_err() {
+            return;
+        }
     }
-
     loop {
         tokio::select! {
-            ev = rx.recv() => {
-                match ev {
-                    Ok(ev) => {
-                        if send_event(&mut socket, &ev).await.is_err() {
-                            break;
-                        }
+            ev = rx.recv() => match ev {
+                Ok(ev) => {
+                    if send_event(&mut socket, &ev).await.is_err() {
+                        break;
                     }
-                    Err(_) => break,
                 }
-            }
-            msg = socket.recv() => {
-                match msg {
-                    Some(Ok(Message::Close(_))) | None => break,
-                    Some(Ok(Message::Ping(p))) => {
-                        if socket.send(Message::Pong(p)).await.is_err() {
-                            break;
-                        }
+                // A slow client missed some events: resync with a fresh status
+                // instead of dropping the connection.
+                Err(broadcast::error::RecvError::Lagged(_)) => {
+                    let status = state.sessions.status().await;
+                    if send_event(&mut socket, &WsEvent::Status { status }).await.is_err() {
+                        break;
                     }
-                    _ => {}
                 }
-            }
+                Err(broadcast::error::RecvError::Closed) => break,
+            },
+            msg = socket.recv() => match msg {
+                Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
+                Some(Ok(Message::Ping(p))) => {
+                    if socket.send(Message::Pong(p)).await.is_err() {
+                        break;
+                    }
+                }
+                _ => {}
+            },
         }
     }
 }
@@ -856,14 +968,4 @@ async fn handle_ws(mut socket: WebSocket, state: AppState) {
 async fn send_event(socket: &mut WebSocket, ev: &WsEvent) -> Result<(), ()> {
     let text = serde_json::to_string(ev).map_err(|_| ())?;
     socket.send(Message::Text(text)).await.map_err(|_| ())
-}
-
-/// Builds a JSON error response with the given status.
-fn error_json(status: StatusCode, message: &str) -> Response {
-    (
-        status,
-        [(header::CONTENT_TYPE, "application/json")],
-        json!({ "ok": false, "error": message }).to_string(),
-    )
-        .into_response()
 }

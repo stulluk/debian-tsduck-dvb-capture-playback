@@ -4,1302 +4,247 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>dvbhub</title>
-  <style>
-    :root {
-      --bg: #0f1419; --panel: #1a2129; --panel2: #222c38; --line: #2c3947;
-      --fg: #e6edf3; --muted: #8b98a5; --accent: #3fb950; --accent2: #58a6ff;
-      --warn: #d29922; --err: #f85149;
-    }
-    * { box-sizing: border-box; }
-    body { margin: 0; font: 14px/1.5 system-ui,sans-serif; background: var(--bg); color: var(--fg); }
-    header { display: flex; align-items: center; gap: 12px; padding: 12px 20px; border-bottom: 1px solid var(--line); background: var(--panel); position: sticky; top: 0; z-index: 10; }
-    header h1 { font-size: 18px; margin: 0; cursor: pointer; }
-    header .tag { color: var(--muted); font-size: 12px; }
-    header .spacer { margin-left: auto; }
-    main { padding: 20px; max-width: 1100px; margin: 0 auto; }
-    .card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 16px 18px; margin-bottom: 18px; }
-    .card h2 { margin: 0 0 12px; font-size: 15px; color: var(--accent2); }
-    .card h3 { margin: 14px 0 8px; font-size: 13px; color: var(--fg); }
-    .row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; margin-bottom: 10px; }
-    label { color: var(--muted); font-size: 12px; display: block; margin-bottom: 4px; }
-    select, input { background: var(--panel2); border: 1px solid var(--line); color: var(--fg); border-radius: 6px; padding: 7px 10px; min-width: 120px; }
-    button { background: var(--accent); color: #06210c; border: 0; border-radius: 7px; padding: 8px 14px; font-weight: 600; cursor: pointer; }
-    button.secondary { background: var(--panel2); color: var(--fg); border: 1px solid var(--line); }
-    button.warn { background: var(--warn); color: #1a1200; }
-    button.danger { background: var(--err); color: #2a0000; }
-    button:disabled { opacity: .45; cursor: default; }
-    table { width: 100%; border-collapse: collapse; margin-top: 6px; font-size: 13px; }
-    th, td { text-align: left; padding: 6px 10px; border-bottom: 1px solid var(--line); }
-    th { color: var(--muted); font-weight: 600; font-size: 11px; text-transform: uppercase; }
-    .mono { font-family: ui-monospace, Menlo, monospace; }
-    .pill { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 12px; }
-    .pill.tuner { background: #16331f; color: var(--accent); }
-    .pill.modulator { background: #2a2238; color: #bc8cff; }
-    .pill.lock-yes { background: #16331f; color: var(--accent); }
-    .pill.lock-no { background: #3d1f1f; color: var(--err); }
-    .muted { color: var(--muted); }
-    .err { color: var(--err); }
-    .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
-    @media (max-width: 700px) { .grid2 { grid-template-columns: 1fr; } }
-    .metric { background: var(--panel2); border-radius: 8px; padding: 10px 12px; }
-    .metric .val { font-size: 20px; font-weight: 700; }
-    .metric .lbl { font-size: 11px; color: var(--muted); text-transform: uppercase; }
-    #log { max-height: 200px; overflow-y: auto; font-size: 11px; color: var(--muted); background: var(--panel2); border-radius: 6px; padding: 8px; font-family: ui-monospace, Menlo, monospace; white-space: pre-wrap; word-break: break-word; }
-    #log .line { padding: 1px 0; border-bottom: 1px solid rgba(255,255,255,.03); }
-    #log .line.err { color: var(--err); }
-    footer { padding: 14px 20px; color: var(--muted); font-size: 12px; border-top: 1px solid var(--line); }
-    .status-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; background: var(--muted); }
-    .status-dot.ok { background: var(--accent); }
-    .status-dot.bad { background: var(--err); }
-    /* Device badges */
-    #badges { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
-    .badge { display: inline-flex; align-items: center; gap: 6px; background: var(--panel2); border: 1px solid var(--line); border-radius: 999px; padding: 3px 10px; font-size: 12px; }
-    .badge .dot { width: 9px; height: 9px; border-radius: 50%; }
-    .badge .dot.on { background: var(--accent); }
-    .badge .dot.off { background: var(--err); }
-    .badge.none { color: var(--warn); border-color: var(--warn); }
-    /* Landing */
-    .tiles { display: grid; grid-template-columns: repeat(2, 1fr); gap: 18px; }
-    @media (max-width: 700px) { .tiles { grid-template-columns: 1fr; } }
-    .tile { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 28px 22px; cursor: pointer; transition: border-color .15s, transform .1s; }
-    .tile:hover { border-color: var(--accent2); transform: translateY(-2px); }
-    .tile h3 { margin: 0 0 6px; font-size: 20px; color: var(--fg); }
-    .tile p { margin: 0; color: var(--muted); font-size: 13px; }
-    .tile .ico { font-size: 30px; margin-bottom: 10px; }
-    .tile.disabled { opacity: .4; cursor: not-allowed; pointer-events: none; filter: grayscale(1); }
-    /* Tabs */
-    .tabs { display: flex; gap: 6px; border-bottom: 1px solid var(--line); margin-bottom: 14px; flex-wrap: wrap; }
-    .tab { padding: 7px 14px; cursor: pointer; border: 1px solid transparent; border-bottom: none; border-radius: 8px 8px 0 0; color: var(--muted); font-size: 13px; }
-    .tab.active { color: var(--fg); background: var(--panel2); border-color: var(--line); }
-    .tabpane { display: none; }
-    .tabpane.active { display: block; }
-    .subview { display: none; }
-    .subview.active { display: block; }
-    .back { color: var(--accent2); cursor: pointer; font-size: 13px; margin-bottom: 12px; display: inline-block; background: none; border: none; padding: 0; font-weight: 400; }
-    .watch-empty { text-align: center; padding: 48px 24px; }
-    .watch-empty p { color: var(--muted); margin-bottom: 18px; font-size: 15px; }
-    .watch-empty button { font-size: 15px; padding: 12px 24px; }
-    .watch-layout { display: grid; grid-template-columns: 280px 1fr; gap: 16px; min-height: 420px; }
-    @media (max-width: 800px) { .watch-layout { grid-template-columns: 1fr; } }
-    .channel-panel { background: var(--panel2); border: 1px solid var(--line); border-radius: 8px; padding: 10px; max-height: 520px; overflow: auto; }
-    .channel-item { display: block; width: 100%; text-align: left; background: transparent; border: 1px solid transparent; border-radius: 6px; padding: 8px 10px; margin-bottom: 4px; cursor: pointer; color: var(--text); }
-    .channel-item:hover { background: var(--panel); border-color: var(--line); }
-    .channel-item.active { background: var(--panel); border-color: var(--accent); }
-    .channel-item .ch-name { font-size: 13px; font-weight: 600; }
-    .channel-item .ch-meta { font-size: 11px; color: var(--muted); margin-top: 2px; }
-    .player-panel { min-width: 0; }
-    #player { width: 100%; max-height: 480px; background: #000; border-radius: 8px; }
-    .soon { background: var(--panel2); border: 1px dashed var(--line); border-radius: 10px; padding: 24px; text-align: center; color: var(--muted); }
-    video { width: 100%; max-width: 760px; background: #000; border-radius: 8px; }
-  </style>
+  <link rel="stylesheet" href="/static/app.css" />
 </head>
 <body>
   <header>
-    <h1 id="home-link">dvbhub</h1>
-    <span class="tag">DVB capture &amp; playback</span>
-    <span class="spacer"></span>
-    <span id="badges"></span>
-    <span class="muted" style="margin-left:12px">
-      <span id="ws-dot" class="status-dot"></span> <span id="conn">…</span>
-    </span>
+    <div class="brand" id="home">dvbhub<span>DVB capture · playout · watch</span></div>
+    <div class="spacer"></div>
+    <div id="job"></div>
+    <div id="badges"></div>
+    <div id="conn"><span class="dot off"></span> connecting…</div>
   </header>
 
   <main>
-    <!-- ============ LANDING ============ -->
-    <div id="view-landing" class="subview active">
+    <!-- Landing -->
+    <section class="page" id="page-home">
       <div class="tiles">
-        <div class="tile" data-route="devices">
-          <div class="ico">📡</div><h3>DVB devices</h3>
-          <p>Inspect connected tuners and modulators.</p>
-        </div>
-        <div class="tile" data-route="capture">
-          <div class="ico">⏺</div><h3>TS capture</h3>
-          <p>Record transport streams from a tuner.</p>
-        </div>
-        <div class="tile" data-route="playback">
-          <div class="ico">📤</div><h3>TS playback</h3>
-          <p>Play a TS file out through the modulator.</p>
-        </div>
-        <div class="tile" data-route="watch">
-          <div class="ico">▶</div><h3>Watch TV</h3>
-          <p>Tune, scan and watch live channels.</p>
-        </div>
+        <div class="tile" data-go="devices"><div class="ico">📡</div><h3>DVB devices</h3><p>Connected tuners and modulators.</p></div>
+        <div class="tile" data-go="capture"><div class="ico">⏺</div><h3>TS capture</h3><p>Record a transponder, a whole satellite, a terrestrial or cable mux.</p></div>
+        <div class="tile" data-go="playback"><div class="ico">📤</div><h3>TS playback</h3><p>Play a TS file out through the DTU-315 modulator.</p></div>
+        <div class="tile" data-go="watch"><div class="ico">▶</div><h3>Watch TV</h3><p>Scan for channels and watch them in the browser.</p></div>
       </div>
-      <p id="landing-msg" class="muted" style="margin-top:18px"></p>
-    </div>
+      <p id="landing-msg" class="muted"></p>
+      <p class="small muted"><a href="#/settings">Settings</a></p>
+    </section>
 
-    <!-- ============ DEVICES ============ -->
-    <div id="view-devices" class="subview">
-      <button type="button" class="back" data-route="landing">← Home</button>
+    <!-- Devices -->
+    <section class="page" id="page-devices">
+      <button class="back" data-go="home">← Home</button>
       <div class="card">
         <h2>DVB devices</h2>
-        <div class="row"><button id="btn-devices">Refresh devices</button></div>
-        <div id="devices"></div>
-        <div id="devices-warn"></div>
+        <p class="small muted">Updated automatically when a device is plugged in or removed.</p>
+        <div class="devices" id="device-cards"></div>
+        <div id="device-warnings"></div>
       </div>
-    </div>
+    </section>
 
-    <!-- ============ TS CAPTURE ============ -->
-    <div id="view-capture" class="subview">
-      <button type="button" class="back" data-route="landing">← Home</button>
+    <!-- Capture -->
+    <section class="page" id="page-capture">
+      <button class="back" data-go="home">← Home</button>
       <div class="card">
         <h2>TS capture</h2>
         <div class="row">
-          <div>
-            <label>Capture device</label>
-            <select id="cap-device"><option value="">— no tuner —</option></select>
-          </div>
+          <div class="field" style="min-width:320px"><label>Capture device</label><select id="cap-device"></select></div>
+          <div class="field"><label>Seconds per transponder / mux</label><input id="cap-seconds" type="number" min="1" max="86400" value="30" style="width:130px" /></div>
         </div>
-        <div class="tabs" id="cap-cat-tabs"></div>
+        <div class="tabs" id="cap-tabs"></div>
 
-        <!-- Satellite capture -->
-        <div class="tabpane" id="cap-pane-satellite">
-          <div class="tabs">
-            <button type="button" class="tab active" data-satmode="tp">TP capture</button>
-            <button type="button" class="tab" data-satmode="sat">SAT capture</button>
+        <!-- Satellite -->
+        <div id="cap-sat" class="hidden">
+          <div class="seg" id="cap-sat-mode">
+            <button data-mode="tp" class="active">Single TP</button>
+            <button data-mode="sat">Whole satellite</button>
+            <button data-mode="manual">Manual TP</button>
           </div>
-
-          <!-- TP capture -->
-          <div class="tabpane active" id="cap-sat-tp">
-            <div class="tabs">
-              <button type="button" class="tab active" data-tpmode="ref">Reference TP</button>
-              <button type="button" class="tab" data-tpmode="manual">Manual TP</button>
-            </div>
-            <div class="tabpane active" id="cap-tp-ref">
-              <div class="row">
-                <div style="flex:1">
-                  <label>Reference transponder</label>
-                  <select id="cap-ref-tp"></select>
-                </div>
-              </div>
-            </div>
-            <div class="tabpane" id="cap-tp-manual">
-              <div class="grid2">
-                <div><label>Frequency (MHz)</label><input id="m-freq" type="number" value="11054" /></div>
-                <div><label>Polarity</label><select id="m-pol"><option value="vertical">Vertical</option><option value="horizontal">Horizontal</option></select></div>
-                <div><label>Symbol rate (kS/s)</label><input id="m-sr" type="number" value="30000" /></div>
-                <div><label>Delivery system</label><select id="m-delsys"><option>DVB-S2</option><option>DVB-S</option></select></div>
-                <div><label>Modulation</label><select id="m-mod"><option>8-PSK</option><option>QPSK</option><option>16-APSK</option><option>32-APSK</option></select></div>
-                <div><label>FEC</label><input id="m-fec" value="3/4" /></div>
-              </div>
-              <div class="row" style="margin-top:8px">
-                <button id="btn-save-ref" class="secondary">★ Save as reference transponder</button>
-                <span id="save-ref-msg" class="muted"></span>
-              </div>
-            </div>
-            <div class="grid2" style="margin-top:8px">
-              <div><label>DiSEqC port</label><input id="cap-diseqc" type="number" min="0" max="63" value="0" style="width:90px" /></div>
-              <div><label>Output file name</label><input id="cap-out" value="capture.ts" /></div>
-              <div><label>Duration (s, 0 = until stop)</label><input id="cap-secs" type="number" min="0" value="15" style="width:90px" /></div>
-            </div>
-            <div class="row" style="margin-top:10px">
-              <button id="btn-cap">Start capture</button>
-              <button id="btn-cap-stop" class="warn" disabled>Stop capture</button>
-              <span id="cap-msg" class="muted"></span>
+          <div id="cap-sat-tp">
+            <div class="row">
+              <div class="field" style="min-width:240px"><label>Source</label><select id="cap-tp-source"></select></div>
+              <div class="field" style="min-width:340px"><label>Transponder</label><select id="cap-tp"></select></div>
             </div>
           </div>
-
-          <!-- SAT capture (all TPs of a satellite) -->
-          <div class="tabpane" id="cap-sat-sat">
+          <div id="cap-sat-sat" class="hidden">
             <div class="row">
-              <div style="flex:1">
-                <label>Satellite</label>
-                <select id="sat-select"></select>
-              </div>
-              <div style="align-self:flex-end">
-                <button id="btn-sat-add" class="secondary">Add</button>
-                <button id="btn-sat-edit" class="secondary">Edit</button>
-                <button id="btn-sat-del" class="danger">Remove</button>
-              </div>
+              <div class="field" style="min-width:260px"><label>Satellite</label><select id="sat-select"></select></div>
+              <button class="secondary" id="sat-add">Add</button>
+              <button class="secondary" id="sat-edit">Edit</button>
+              <button class="danger" id="sat-del">Remove</button>
+              <div class="field"><label>KingOfSat position</label><input id="kos-pos" placeholder="13E" style="width:90px" /></div>
+              <button class="secondary" id="kos-import">Import / refresh</button>
             </div>
-            <div class="row">
-              <div>
-                <label>Import from KingOfSat (pos, e.g. 42E)</label>
-                <input id="kos-pos" placeholder="42E" style="width:120px" />
+            <div id="sat-editor" class="card hidden" style="background:var(--panel2)">
+              <div class="grid">
+                <div class="field"><label>Name</label><input id="se-name" /></div>
+                <div class="field"><label>Longitude</label><input id="se-lon" placeholder="13.0E" /></div>
+                <div class="field"><label>LNB</label><select id="se-lnb"></select></div>
+                <div class="field"><label>DiSEqC port (0-63)</label><input id="se-diseqc" type="number" min="0" max="63" /></div>
               </div>
-              <div style="align-self:flex-end"><button id="btn-kos" class="secondary">⤓ Import</button></div>
-              <span id="kos-msg" class="muted"></span>
+              <button id="se-save">Save satellite</button> <button class="secondary" id="se-cancel">Cancel</button>
             </div>
-
-            <!-- Satellite editor (hidden until Add/Edit) -->
-            <div id="sat-editor" class="card" style="display:none;background:var(--panel2)">
-              <h3 id="sat-editor-title">Edit satellite</h3>
-              <div class="grid2">
-                <div><label>Name</label><input id="se-name" /></div>
-                <div><label>Longitude</label><input id="se-lon" placeholder="42.0E" /></div>
-                <div><label>LNB</label><select id="se-lnb"><option value="universal">Universal (Ku auto)</option><option value="0">Direct L-band (0)</option></select></div>
-                <div><label>DiSEqC port</label><input id="se-diseqc" type="number" min="0" max="63" value="0" /></div>
-              </div>
-              <div class="row" style="margin-top:8px">
-                <button id="btn-sat-save">Save satellite</button>
-                <button id="btn-sat-cancel" class="secondary">Cancel</button>
-              </div>
-            </div>
-
-            <h3>Transponders <span id="sat-tp-count" class="muted"></span></h3>
-            <div id="sat-tp-list"></div>
-            <details style="margin-top:8px">
-              <summary class="muted" style="cursor:pointer">Add / edit transponder</summary>
-              <div class="grid2" style="margin-top:8px">
-                <div><label>Frequency (MHz)</label><input id="te-freq" type="number" /></div>
-                <div><label>Polarity</label><select id="te-pol"><option value="vertical">Vertical</option><option value="horizontal">Horizontal</option></select></div>
-                <div><label>Symbol rate (kS/s)</label><input id="te-sr" type="number" /></div>
-                <div><label>Delivery</label><select id="te-delsys"><option>DVB-S2</option><option>DVB-S</option></select></div>
-                <div><label>Modulation</label><select id="te-mod"><option>8-PSK</option><option>QPSK</option><option>16-APSK</option><option>32-APSK</option></select></div>
-                <div><label>FEC</label><input id="te-fec" value="3/4" /></div>
-                <div><label>Note</label><input id="te-name" /></div>
-              </div>
-              <div class="row" style="margin-top:8px">
-                <input type="hidden" id="te-index" value="-1" />
-                <button id="btn-tp-save" class="secondary">Save transponder</button>
-                <button id="btn-tp-clear" class="secondary">Clear</button>
-              </div>
+            <h3>Transponders <span id="sat-tp-count"></span></h3>
+            <div class="scroll"><table><thead><tr><th>Freq</th><th>Pol</th><th>SR</th><th>System</th><th>Mod</th><th>FEC</th><th></th></tr></thead><tbody id="sat-tps"></tbody></table></div>
+            <details style="margin-top:8px"><summary class="small muted" style="cursor:pointer">Add / edit transponder</summary>
+              <div class="grid" style="margin-top:8px" id="te-form"></div>
+              <button class="secondary" id="te-save">Save transponder</button> <button class="secondary" id="te-clear">Clear</button>
             </details>
-
-            <div class="grid2" style="margin-top:10px">
-              <div><label>Duration per TP (s)</label><input id="sat-secs" type="number" min="1" value="10" style="width:90px" /></div>
-            </div>
-            <div class="row">
-              <button id="btn-sat-cap">Capture whole satellite</button>
-              <button id="btn-sat-cap-stop" class="warn" disabled>Stop</button>
-              <span id="sat-cap-msg" class="muted"></span>
-            </div>
+          </div>
+          <div id="cap-sat-manual" class="hidden">
+            <div class="grid" id="manual-form"></div>
+            <button class="secondary" id="save-ref">★ Save as reference transponder</button>
           </div>
         </div>
 
-        <!-- Terrestrial / cable (basic) -->
-        <div class="tabpane" id="cap-pane-terrestrial">
-          <div class="grid2">
-            <div><label>Delivery system</label><select id="t-delsys"><option>DVB-T2</option><option>DVB-T</option><option>ATSC</option><option>ISDB-T</option></select></div>
-            <div><label>Frequency (MHz)</label><input id="t-freq" type="number" value="514" /></div>
-            <div><label>Output file name</label><input id="t-out" value="capture_terr.ts" /></div>
-            <div><label>Duration (s)</label><input id="t-secs" type="number" min="0" value="15" style="width:90px" /></div>
+        <!-- Terrestrial -->
+        <div id="cap-ter" class="hidden">
+          <div class="grid">
+            <div class="field"><label>UHF channel</label><select id="ter-uhf"></select></div>
+            <div class="field"><label>Frequency (MHz)</label><input id="ter-freq" type="number" value="618" /></div>
+            <div class="field"><label>Delivery system</label><select id="ter-sys"><option>DVB-T2</option><option>DVB-T</option></select></div>
+            <div class="field"><label>Bandwidth (MHz)</label><select id="ter-bw"><option>8</option><option>7</option><option>6</option></select></div>
+            <div class="field"><label>PLP (T2)</label><input id="ter-plp" type="number" min="0" max="255" value="0" /></div>
           </div>
-          <div class="row" style="margin-top:8px">
-            <button id="btn-cap-terr">Start capture</button>
-            <button id="btn-cap-terr-stop" class="warn" disabled>Stop capture</button>
-            <span id="terr-msg" class="muted"></span>
-          </div>
-          <p class="muted" style="font-size:11px">Basic terrestrial capture (bandwidth/PLP options coming soon).</p>
         </div>
-        <div class="tabpane" id="cap-pane-cable">
-          <div class="grid2">
-            <div><label>Delivery system</label><select id="c-delsys"><option>DVB-C</option></select></div>
-            <div><label>Frequency (MHz)</label><input id="c-freq" type="number" value="474" /></div>
-            <div><label>Symbol rate (kS/s)</label><input id="c-sr" type="number" value="6900" /></div>
-            <div><label>Modulation</label><select id="c-mod"><option>64-QAM</option><option>256-QAM</option><option>128-QAM</option></select></div>
-            <div><label>Output file name</label><input id="c-out" value="capture_cable.ts" /></div>
-            <div><label>Duration (s)</label><input id="c-secs" type="number" min="0" value="15" style="width:90px" /></div>
+
+        <!-- Cable -->
+        <div id="cap-cab" class="hidden">
+          <div class="grid">
+            <div class="field"><label>Frequency (MHz)</label><input id="cab-freq" type="number" value="722" /></div>
+            <div class="field"><label>Symbol rate (kS/s)</label><input id="cab-sr" type="number" value="6875" /></div>
+            <div class="field"><label>Modulation</label><select id="cab-mod"><option>256-QAM</option><option>128-QAM</option><option>64-QAM</option><option>32-QAM</option><option>16-QAM</option></select></div>
           </div>
-          <div class="row" style="margin-top:8px">
-            <button id="btn-cap-cable">Start capture</button>
-            <button id="btn-cap-cable-stop" class="warn" disabled>Stop capture</button>
-            <span id="cable-msg" class="muted"></span>
-          </div>
+        </div>
+
+        <div class="row" style="margin-top:6px">
+          <button id="cap-start">Start capture</button>
+          <button class="secondary" id="cap-stop" disabled>Stop</button>
+          <span id="cap-msg" class="muted"></span>
+        </div>
+        <div id="cap-progress" class="hidden">
+          <div class="progress"><div id="cap-bar"></div></div>
+          <div id="cap-now" class="small"></div>
+          <div class="metrics" id="cap-metrics"></div>
+          <div id="cap-files" class="small mono"></div>
         </div>
       </div>
-    </div>
+    </section>
 
-    <!-- ============ TS PLAYBACK ============ -->
-    <div id="view-playback" class="subview">
-      <button type="button" class="back" data-route="landing">← Home</button>
+    <!-- Playback -->
+    <section class="page" id="page-playback">
+      <button class="back" data-go="home">← Home</button>
       <div class="card">
-        <h2>TS playback (DTU-315 modulator)</h2>
+        <h2>TS playback (DTU-315)</h2>
         <div class="row">
-          <div style="flex:1">
-            <label>Reference capture (load saved params)</label>
-            <select id="pb-ref"><option value="">— none —</option></select>
-          </div>
-          <div style="align-self:flex-end"><button id="btn-pb-ref-del" class="danger">Remove</button></div>
+          <div class="field" style="flex:1;min-width:320px"><label>TS file (capture directory, newest first)</label><select id="pb-file"></select></div>
+          <div class="field" style="flex:1;min-width:240px"><label>…or a path</label><input id="pb-path" placeholder="/media/…/file.ts" /></div>
         </div>
-        <div class="grid2">
-          <div>
-            <label>TS file</label>
-            <select id="pb-file"><option value="">— select capture —</option></select>
-          </div>
-          <div><label>Output IF frequency (MHz)</label><input id="pb-freq" type="number" value="1200" /></div>
-          <div><label>Modulation</label><select id="pb-mod"><option>DVB-S2-8PSK</option><option>DVB-S2-QPSK</option><option>DVB-S-QPSK</option></select></div>
-          <div><label>Symbol rate (kS/s)</label><input id="pb-sr" type="number" value="30000" /></div>
-          <div><label>Code rate</label><input id="pb-cr" value="3/4" /></div>
-          <div><label>Level (0.1 dBm, optional)</label><input id="pb-level" type="number" placeholder="-300" /></div>
+        <p id="pb-hint" class="small muted"></p>
+        <div class="tabs" id="pb-tabs"></div>
+        <div class="grid" id="pb-form"></div>
+        <div class="row">
+          <label class="check"><input type="checkbox" id="pb-loop" checked /> Loop forever</label>
+          <div class="field"><label>Level (0.1 dBm, optional)</label><input id="pb-level" type="number" placeholder="-300" style="width:130px" /></div>
         </div>
-        <div class="row" style="margin-top:8px">
-          <label style="display:flex;align-items:center;gap:6px;margin:0"><input type="checkbox" id="pb-inf" style="min-width:auto" /> Loop forever</label>
-        </div>
-        <div class="row" style="margin-top:8px">
-          <button id="btn-pb-play">Play out</button>
-          <button id="btn-pb-stop" class="warn" disabled>Stop</button>
+        <div class="row">
+          <button id="pb-play">Play out</button>
+          <button class="secondary" id="pb-stop" disabled>Stop</button>
           <span id="pb-msg" class="muted"></span>
         </div>
-        <h3>Save as reference capture</h3>
+        <h3>Reference captures</h3>
         <div class="row">
-          <input id="pb-save-name" placeholder="reference name" />
-          <button id="btn-pb-save" class="secondary">★ Save</button>
-          <span id="pb-save-msg" class="muted"></span>
+          <div class="field" style="min-width:260px"><label>Load saved</label><select id="ref-list"></select></div>
+          <button class="danger" id="ref-del">Remove</button>
+          <div class="field"><label>Save current as</label><input id="ref-name" placeholder="name" /></div>
+          <button class="secondary" id="ref-save">★ Save as reference capture</button>
         </div>
       </div>
-    </div>
+    </section>
 
-    <!-- ============ WATCH TV ============ -->
-    <div id="view-watch" class="subview">
-      <button type="button" class="back" data-route="landing">← Home</button>
-
-      <!-- No channels yet: single entry point -->
-      <div id="watch-empty" class="card watch-empty">
-        <p>No channels have been scanned yet.</p>
-        <button type="button" id="btn-watch-start-scan">Scan for channels</button>
+    <!-- Watch -->
+    <section class="page" id="page-watch">
+      <button class="back" data-go="home">← Home</button>
+      <div class="card empty hidden" id="watch-empty">
+        <p>No channels yet.</p>
+        <button id="watch-start-scan">Please scan for channels</button>
       </div>
-
-      <!-- Channels exist (or user opened scan from empty state) -->
-      <div id="watch-main" class="card" style="display:none">
-        <h2>Watch TV</h2>
-        <div class="tabs" id="watch-mode-tabs">
-          <button type="button" class="tab" data-wmode="scan">Scan for channels</button>
-          <button type="button" class="tab" data-wmode="watch">Watch Channels</button>
+      <div class="card hidden" id="watch-main">
+        <div class="tabs" id="watch-tabs">
+          <button class="tab active" data-wt="watch">Watch channels</button>
+          <button class="tab" data-wt="scan">Scan for channels</button>
         </div>
-
-        <!-- Scan mode -->
-        <div class="tabpane" id="watch-mode-scan">
-          <div class="tabs" id="watch-scan-delivery-tabs">
-            <button type="button" class="tab active" data-scan-del="satellite">DVB-S</button>
-            <button type="button" class="tab" data-scan-del="terrestrial">DVB-T</button>
-            <button type="button" class="tab" data-scan-del="cable">DVB-C</button>
-          </div>
-
-          <div class="tabpane active" id="scan-pane-satellite">
-            <div class="grid2">
-              <div>
-                <label>Tuner</label>
-                <select id="w-device"><option value="">— no tuner —</option></select>
-              </div>
-              <div>
-                <label>Reference transponder</label>
-                <select id="w-tp"></select>
-              </div>
-              <div><label>DiSEqC port</label><input id="w-diseqc" type="number" min="0" max="63" value="0" style="width:90px" /></div>
+        <div id="watch-pane-watch">
+          <div class="watch">
+            <div>
+              <div class="tabs" id="ch-tabs"></div>
+              <input id="ch-filter" placeholder="Filter channels…" style="width:100%;margin-bottom:8px" />
+              <div class="chlist" id="ch-list"></div>
+              <p class="small muted" id="ch-count"></p>
             </div>
-            <div class="row" style="margin-top:12px">
-              <button id="btn-tune">Lock / monitor</button>
-              <button id="btn-tune-stop" class="secondary" disabled>Stop</button>
-              <button id="btn-scan" class="secondary">NIT scan</button>
-              <button id="btn-scan-stop" class="secondary" disabled>Stop scan</button>
-              <span id="tune-msg" class="muted"></span>
-            </div>
-            <div class="grid2" style="margin-top:14px">
-              <div class="metric"><div class="lbl">Lock</div><div class="val" id="m-lock">—</div></div>
-              <div class="metric"><div class="lbl">SNR</div><div class="val" id="m-snr">—</div></div>
-              <div class="metric"><div class="lbl">Strength</div><div class="val" id="m-str">—</div></div>
-              <div class="metric"><div class="lbl">BER</div><div class="val" id="m-ber">—</div></div>
-            </div>
-            <div class="row" style="margin-top:12px">
-              <button id="btn-save-channels" class="secondary">Save FTA channels</button>
-              <label style="display:flex;align-items:center;gap:6px;margin:0;font-size:12px"><input type="checkbox" id="ch-replace" style="min-width:auto" /> Replace existing list for this delivery</label>
-              <span id="save-ch-msg" class="muted"></span>
-            </div>
-            <h3>Services on current transponder</h3>
-            <div id="services"><p class="muted">Lock a transponder to list services.</p></div>
-            <h3>NIT scan results</h3>
-            <div id="scan-results"><p class="muted">No scan results yet.</p></div>
-          </div>
-          <div class="tabpane" id="scan-pane-terrestrial"><div class="soon">DVB-T scanning — coming soon.</div></div>
-          <div class="tabpane" id="scan-pane-cable"><div class="soon">DVB-C scanning — coming soon.</div></div>
-        </div>
-
-        <!-- Watch mode -->
-        <div class="tabpane" id="watch-mode-watch">
-          <div class="watch-layout">
-            <div class="channel-panel">
-              <div class="tabs" id="watch-list-delivery-tabs">
-                <button type="button" class="tab active" data-list-del="satellite">DVB-S</button>
-                <button type="button" class="tab" data-list-del="terrestrial">DVB-T</button>
-                <button type="button" class="tab" data-list-del="cable">DVB-C</button>
-              </div>
-              <div id="channel-list"><p class="muted">No channels for this delivery.</p></div>
-            </div>
-            <div class="player-panel">
-              <video id="player" controls style="display:none"></video>
-              <div class="row" style="margin-top:10px">
-                <button id="btn-play-stop" class="warn" disabled>Stop playback</button>
+            <div>
+              <video id="player" controls playsinline></video>
+              <div class="row" style="margin-top:8px">
+                <button class="secondary" id="play-stop" disabled>Stop</button>
                 <span id="play-msg" class="muted"></span>
               </div>
-              <p id="now-playing" class="muted" style="margin-top:8px;font-size:13px"></p>
+              <div class="metrics" id="play-metrics"></div>
             </div>
           </div>
         </div>
+        <div id="watch-pane-scan" class="hidden">
+          <div class="tabs" id="scan-tabs"></div>
+          <div class="row">
+            <div class="field" style="min-width:320px"><label>Tuner</label><select id="scan-device"></select></div>
+          </div>
+          <div id="scan-sat" class="grid">
+            <div class="field"><label>Satellite</label><select id="scan-sat-name"></select></div>
+            <div class="field"><label>Only these TPs (optional)</label><input id="scan-tps" placeholder="10719v 10930h" /></div>
+          </div>
+          <div id="scan-ter" class="grid hidden">
+            <div class="field" style="grid-column: span 2"><label>Frequencies in MHz (empty = whole UHF band 21–69)</label><input id="scan-ter-freqs" placeholder="618 682" /></div>
+            <div class="field"><label>Bandwidth (MHz)</label><select id="scan-ter-bw"><option>8</option><option>7</option></select></div>
+          </div>
+          <div id="scan-cab" class="grid hidden">
+            <div class="field" style="grid-column: span 2"><label>Frequencies in MHz</label><input id="scan-cab-freqs" placeholder="722" /></div>
+            <div class="field"><label>Symbol rate (kS/s)</label><input id="scan-cab-sr" type="number" value="6875" /></div>
+            <div class="field"><label>Modulation</label><select id="scan-cab-mod"><option>256-QAM</option><option>64-QAM</option><option>128-QAM</option></select></div>
+          </div>
+          <div class="row">
+            <label class="check"><input type="checkbox" id="scan-radio" checked /> Radio</label>
+            <label class="check"><input type="checkbox" id="scan-scrambled" /> Scrambled</label>
+            <label class="check"><input type="checkbox" id="scan-replace" /> Replace existing channels of this source</label>
+          </div>
+          <div class="row">
+            <button id="scan-start">Start scan</button>
+            <button class="secondary" id="scan-stop" disabled>Stop</button>
+            <button class="danger" id="scan-clear">Delete these channels</button>
+            <span id="scan-msg" class="muted"></span>
+          </div>
+          <div class="progress"><div id="scan-bar"></div></div>
+          <div class="scroll"><table><thead><tr><th>#</th><th>Target</th><th>Lock</th><th>SNR</th><th>Services</th><th>Channels</th></tr></thead><tbody id="scan-rows"></tbody></table></div>
+        </div>
       </div>
-    </div>
+    </section>
 
-    <!-- ============ SETTINGS + LOG (shared) ============ -->
-    <div id="shared-bottom">
-      <div class="card" id="settings-card">
+    <!-- Settings -->
+    <section class="page" id="page-settings">
+      <button class="back" data-go="home">← Home</button>
+      <div class="card">
         <h2>Settings</h2>
         <div class="row">
-          <div style="flex:1">
-            <label>Capture &amp; HLS directory</label>
-            <input id="cfg-capture-dir" type="text" placeholder="loading…" style="width:100%;min-width:280px" />
-          </div>
-          <div style="align-self:flex-end"><button id="btn-cfg-save">Save</button></div>
-          <span id="cfg-msg" class="muted"></span>
+          <div class="field" style="flex:1;min-width:320px"><label>Capture directory</label><input id="cfg-dir" /></div>
+          <button id="cfg-save">Save</button>
         </div>
-        <p class="muted" style="margin:4px 0 0">Config: <span class="mono" id="cfg-file">—</span></p>
-        <p class="muted" style="margin:4px 0 0">Log: <span class="mono" id="cfg-log">—</span></p>
+        <table class="small"><tbody id="cfg-info"></tbody></table>
       </div>
-      <div class="card">
-        <h2>Log</h2>
-        <div id="log"></div>
-      </div>
-    </div>
+    </section>
   </main>
 
-  <footer>dvbhub — local only · <span class="mono" id="origin"></span></footer>
+  <div id="toast"></div>
+  <div id="logbar">
+    <div class="head" id="log-head"><strong>Activity log</strong><span class="last" id="log-last"></span><span class="muted">▲</span></div>
+    <div id="log"></div>
+  </div>
 
-  <script src="/hls.js"></script>
-  <script>
-    const $ = (s) => document.querySelector(s);
-    const $$ = (s) => Array.from(document.querySelectorAll(s));
-    $("#origin").textContent = location.origin;
-
-    let ws;
-    let hlsPlayer = null;
-    let hlsStarting = false;
-    let expectedPlaySid = null;
-    let playWaitGen = 0;
-    let wasCapturing = false;
-    const stateData = { devices: [], warnings: [], tuners: [], modulators: [], satellites: [], refTps: [], channels: [] };
-    let watchScanDelivery = "satellite";
-    let watchListDelivery = "satellite";
-    let selectedChannelId = null;
-
-    // ---------- logging ----------
-    const LOG_MAX = 300;
-    function log(line, isErr) {
-      const el = $("#log");
-      const div = document.createElement("div");
-      div.className = "line" + (isErr ? " err" : "");
-      div.textContent = line;
-      el.appendChild(div);
-      while (el.childNodes.length > LOG_MAX) el.removeChild(el.firstChild);
-      const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
-      if (nearBottom) el.scrollTop = el.scrollHeight;
-    }
-
-    async function api(method, path, body) {
-      const opt = { method };
-      if (body !== undefined) {
-        opt.headers = { "Content-Type": "application/json" };
-        opt.body = JSON.stringify(body);
-      }
-      const r = await fetch(path, opt);
-      const j = await r.json().catch(() => ({}));
-      if (!r.ok) throw new Error(j.error || ("HTTP " + r.status));
-      return j;
-    }
-
-    // ---------- router ----------
-    const ROUTES = ["landing", "devices", "capture", "playback", "watch"];
-    function go(route) {
-      if (!ROUTES.includes(route)) route = "landing";
-      location.hash = route === "landing" ? "" : "#/" + route;
-    }
-    function renderRoute() {
-      let route = (location.hash || "").replace(/^#\/?/, "") || "landing";
-      if (!ROUTES.includes(route)) route = "landing";
-      ROUTES.forEach((r) => $("#view-" + r).classList.toggle("active", r === route));
-      // Hide settings/log on landing for a cleaner home screen.
-      $("#shared-bottom").style.display = route === "landing" ? "none" : "block";
-      if (route === "devices") refreshDevices();
-      if (route === "capture") onCaptureOpen();
-      if (route === "playback") onPlaybackOpen();
-      if (route === "watch") onWatchOpen();
-    }
-    window.addEventListener("hashchange", renderRoute);
-    $("#home-link").onclick = () => go("landing");
-    $$("[data-route]").forEach((e) => (e.onclick = () => go(e.dataset.route)));
-
-    // ---------- WebSocket ----------
-    function connectWs() {
-      const proto = location.protocol === "https:" ? "wss" : "ws";
-      ws = new WebSocket(proto + "://" + location.host + "/ws");
-      ws.onopen = () => { $("#ws-dot").className = "status-dot ok"; };
-      ws.onclose = () => { $("#ws-dot").className = "status-dot bad"; setTimeout(connectWs, 2000); };
-      ws.onmessage = (ev) => {
-        try {
-          const msg = JSON.parse(ev.data);
-          if (msg.type === "signal") updateSignal(msg.signal);
-          else if (msg.type === "services") renderServices(msg.services);
-          else if (msg.type === "status") updateStatus(msg.status);
-          else if (msg.type === "scan_complete") renderScan(msg.transponders);
-          else if (msg.type === "play_started") {
-            if (expectedPlaySid !== null && msg.service_id !== expectedPlaySid) return;
-            waitForHls(hlsUrl(msg.hls_url), msg.service_id, playWaitGen);
-          }
-          else if (msg.type === "devices") applyDevices(msg.devices, msg.warnings);
-          else if (msg.type === "error") { log(msg.message, true); }
-          else if (msg.type === "log") { if (!msg.line.trim().startsWith("{")) log(msg.line); }
-        } catch (e) {}
-      };
-    }
-
-    // ---------- devices + badges + landing gating ----------
-    function applyDevices(devices, warnings) {
-      stateData.devices = devices || [];
-      stateData.warnings = warnings || [];
-      stateData.tuners = stateData.devices.filter((d) => d.kind === "tuner");
-      stateData.modulators = stateData.devices.filter((d) => d.kind === "modulator");
-      renderBadges();
-      gateLanding();
-      fillTunerSelects();
-      if ($("#view-devices").classList.contains("active")) renderDeviceTable();
-      if ($("#view-capture").classList.contains("active")) buildCatTabs();
-    }
-
-    function renderBadges() {
-      const el = $("#badges");
-      const items = [];
-      stateData.devices.forEach((d) => {
-        items.push(`<span class="badge"><span class="dot on"></span>${d.label}</span>`);
-      });
-      // Known devices present on USB but not usable -> red dot.
-      (stateData.warnings || []).forEach((w) => {
-        const name = (w.split(" (")[0] || "device").trim();
-        items.push(`<span class="badge"><span class="dot off"></span>${name}</span>`);
-      });
-      el.innerHTML = items.length ? items.join("") : '<span class="badge none">no DVB devices available</span>';
-    }
-
-    function gateLanding() {
-      const hasTuner = stateData.tuners.length > 0;
-      const hasMod = stateData.modulators.length > 0;
-      const hasAny = stateData.devices.length > 0;
-      setTile("devices", hasAny);
-      setTile("capture", hasTuner);
-      setTile("playback", hasMod);
-      setTile("watch", hasTuner);
-      $("#landing-msg").textContent = hasAny ? "" : "No DVB devices detected. Connect a tuner or modulator.";
-    }
-    function setTile(route, enabled) {
-      const t = document.querySelector(`.tile[data-route="${route}"]`);
-      if (t) t.classList.toggle("disabled", !enabled);
-    }
-
-    function fillTunerSelects() {
-      const opts = stateData.tuners.map((d) => `<option value="${d.address}">${d.label} @ ${d.address}</option>`).join("")
-        || '<option value="">— no tuner —</option>';
-      ["#cap-device", "#w-device"].forEach((sel) => {
-        const cur = $(sel).value;
-        $(sel).innerHTML = opts;
-        if (cur) $(sel).value = cur;
-      });
-      // default to a satellite-capable tuner for capture
-      const sat = stateData.tuners.find((d) => (d.categories || []).includes("satellite"));
-      if (sat && !$("#cap-device").value) $("#cap-device").value = sat.address;
-    }
-
-    function deviceCategories(addr) {
-      const d = stateData.tuners.find((t) => t.address === addr);
-      return d ? (d.categories || []) : [];
-    }
-
-    async function refreshDevices() {
-      try {
-        const d = await api("GET", "/api/devices");
-        applyDevices(d.devices, d.warnings);
-        renderDeviceTable();
-      } catch (e) { $("#devices").innerHTML = '<span class="err">' + e.message + '</span>'; }
-    }
-    function renderDeviceTable() {
-      const rows = (stateData.devices || []).map((dev) => `<tr>
-        <td>${dev.label}</td><td><span class="pill ${dev.kind}">${dev.kind}</span></td>
-        <td class="mono">${dev.address}</td><td class="mono muted">${dev.vid_pid || ""}</td>
-        <td class="muted">${(dev.delivery_systems || []).join(", ")}</td></tr>`).join("");
-      $("#devices").innerHTML = rows
-        ? `<table><thead><tr><th>Device</th><th>Role</th><th>Address</th><th>USB</th><th>Delivery</th></tr></thead><tbody>${rows}</tbody></table>`
-        : '<p class="muted">No devices.</p>';
-      const warns = (stateData.warnings || []).map((w) => `<p class="muted">! ${w}</p>`).join("");
-      $("#devices-warn").innerHTML = warns;
-    }
-    $("#btn-devices").onclick = refreshDevices;
-
-    // ---------- tabs helpers ----------
-    function bindTabs(container, attr, onPick) {
-      container.querySelectorAll(".tab").forEach((tab) => {
-        tab.onclick = () => {
-          container.querySelectorAll(".tab").forEach((t) => t.classList.remove("active"));
-          tab.classList.add("active");
-          onPick(tab.dataset[attr]);
-        };
-      });
-    }
-
-    // ============ TS CAPTURE ============
-    async function onCaptureOpen() {
-      capNameUserEdited = false;
-      buildCatTabs();
-      await Promise.all([loadRefTpSelect(), loadSatSelect()]);
-      autofillCapName();
-    }
-    function buildCatTabs() {
-      const cats = deviceCategories($("#cap-device").value);
-      const labels = { satellite: "Sat capture", terrestrial: "Terr capture", cable: "Cable capture" };
-      const order = ["satellite", "terrestrial", "cable"].filter((c) => cats.includes(c));
-      const tabsEl = $("#cap-cat-tabs");
-      if (!order.length) { tabsEl.innerHTML = '<span class="muted">Select a capture device.</span>'; showCatPane(null); return; }
-      tabsEl.innerHTML = order.map((c, i) => `<button type="button" class="tab ${i === 0 ? "active" : ""}" data-cat="${c}">${labels[c]}</button>`).join("");
-      bindTabs(tabsEl, "cat", showCatPane);
-      showCatPane(order[0]);
-    }
-    function showCatPane(cat) {
-      ["satellite", "terrestrial", "cable"].forEach((c) =>
-        $("#cap-pane-" + c).classList.toggle("active", c === cat));
-    }
-    $("#cap-device").onchange = buildCatTabs;
-
-    // sat sub-mode tabs (TP / SAT)
-    bindTabs($("#cap-sat-tp").parentElement.querySelector(".tabs"), "satmode", (m) => {
-      $("#cap-sat-tp").classList.toggle("active", m === "tp");
-      $("#cap-sat-sat").classList.toggle("active", m === "sat");
-      if (m === "sat") loadSatSelect();
-    });
-    // TP mode tabs (ref / manual)
-    bindTabs($("#cap-tp-ref").parentElement.querySelector(".tabs"), "tpmode", (m) => {
-      $("#cap-tp-ref").classList.toggle("active", m === "ref");
-      $("#cap-tp-manual").classList.toggle("active", m === "manual");
-      autofillCapName();
-    });
-
-    async function loadRefTpSelect() {
-      try {
-        const db = await api("GET", "/api/reference-transponders");
-        stateData.refTps = db.transponders || [];
-        const opts = stateData.refTps.map((t, i) =>
-          `<option value="${i}">${t.frequency_mhz} ${t.polarity[0].toUpperCase()} ${t.delivery_system} ${t.modulation} ${t.fec}${t.name ? " — " + t.name : ""}</option>`).join("");
-        $("#cap-ref-tp").innerHTML = opts || '<option value="">no reference transponders</option>';
-        // also fill the watch TP select
-        $("#w-tp").innerHTML = opts || '<option value="">no reference transponders</option>';
-      } catch (e) { log("ref TP load: " + e.message, true); }
-    }
-
-    function manualTpBody() {
-      return {
-        frequency_mhz: parseInt($("#m-freq").value, 10),
-        polarity: $("#m-pol").value,
-        symbol_rate_ksps: parseInt($("#m-sr").value, 10),
-        modulation: $("#m-mod").value,
-        fec: $("#m-fec").value,
-        delivery_system: $("#m-delsys").value,
-        name: "",
-      };
-    }
-
-    // ---- default capture file name: <satname>_<freq><pol><sr>_<ts>.ts ----
-    let capNameUserEdited = false;
-    function tsStamp() {
-      const d = new Date(), p = (n) => String(n).padStart(2, "0");
-      return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`;
-    }
-    function slugify(s) { return (s || "").toLowerCase().replace(/[^a-z0-9]+/g, ""); }
-    function activeCapTp() {
-      const refMode = $("#cap-tp-ref").classList.contains("active");
-      if (refMode) {
-        const t = stateData.refTps[parseInt($("#cap-ref-tp").value, 10)];
-        return t ? { frequency_mhz: t.frequency_mhz, polarity: t.polarity, symbol_rate_ksps: t.symbol_rate_ksps } : null;
-      }
-      const f = parseInt($("#m-freq").value, 10);
-      return f ? { frequency_mhz: f, polarity: $("#m-pol").value, symbol_rate_ksps: parseInt($("#m-sr").value, 10) } : null;
-    }
-    function satNameForTp(freq, pol) {
-      for (const s of (stateData.satellites || [])) {
-        if ((s.transponders || []).some((t) => t.frequency_mhz === freq && (!pol || t.polarity === pol))) return s.name;
-      }
-      return "";
-    }
-    function defaultCapName() {
-      const tp = activeCapTp();
-      if (!tp || !tp.frequency_mhz) return "";
-      const pol = (tp.polarity || "").charAt(0).toLowerCase();
-      const sat = slugify(satNameForTp(tp.frequency_mhz, tp.polarity)) || "sat";
-      return `${sat}_${tp.frequency_mhz}${pol}${tp.symbol_rate_ksps || 0}_${tsStamp()}.ts`;
-    }
-    function autofillCapName() {
-      if (capNameUserEdited) return;
-      const n = defaultCapName();
-      if (n) $("#cap-out").value = n;
-    }
-    $("#cap-out").addEventListener("input", () => { capNameUserEdited = true; });
-    $("#cap-ref-tp").addEventListener("change", autofillCapName);
-    ["m-freq", "m-pol", "m-sr"].forEach((id) =>
-      $("#" + id).addEventListener("input", autofillCapName));
-    // build a tune body for capture from the active TP mode
-    function captureTuneBody() {
-      const dev = $("#cap-device").value;
-      const diseqc = parseInt($("#cap-diseqc").value, 10) || 0;
-      const refMode = $("#cap-tp-ref").classList.contains("active");
-      if (refMode) {
-        const t = stateData.refTps[parseInt($("#cap-ref-tp").value, 10)];
-        if (!t) throw new Error("no reference transponder selected");
-        return {
-          device_name: dev, satellite_number: diseqc, signal_timeout_s: 15,
-          delivery_system: t.delivery_system, frequency_mhz: t.frequency_mhz,
-          polarity: t.polarity, symbol_rate_ksps: t.symbol_rate_ksps,
-          modulation: t.modulation, fec: t.fec,
-        };
-      }
-      const t = manualTpBody();
-      return {
-        device_name: dev, satellite_number: diseqc, signal_timeout_s: 15,
-        delivery_system: t.delivery_system, frequency_mhz: t.frequency_mhz,
-        polarity: t.polarity, symbol_rate_ksps: t.symbol_rate_ksps,
-        modulation: t.modulation, fec: t.fec,
-      };
-    }
-
-    $("#btn-save-ref").onclick = async () => {
-      try {
-        await api("POST", "/api/reference-transponders", manualTpBody());
-        $("#save-ref-msg").textContent = "saved";
-        loadRefTpSelect();
-      } catch (e) { $("#save-ref-msg").innerHTML = '<span class="err">' + e.message + '</span>'; }
-    };
-
-    $("#btn-cap").onclick = async () => {
-      if (!$("#cap-device").value) return;
-      // refresh the timestamp at capture time unless the user typed a custom name
-      autofillCapName();
-      $("#cap-msg").textContent = "starting capture…";
-      try {
-        await api("POST", "/api/session/capture", {
-          tune: captureTuneBody(), output: $("#cap-out").value,
-          seconds: parseInt($("#cap-secs").value, 10) || 0,
-        });
-        $("#btn-cap-stop").disabled = false;
-      } catch (e) { $("#cap-msg").innerHTML = '<span class="err">' + e.message + '</span>'; }
-    };
-    $("#btn-cap-stop").onclick = async () => {
-      const r = await api("DELETE", "/api/session/capture");
-      $("#cap-msg").textContent = r.output ? "saved " + r.output : "stopped";
-      $("#btn-cap-stop").disabled = true;
-    };
-
-    // terrestrial / cable basic capture
-    $("#btn-cap-terr").onclick = async () => {
-      $("#terr-msg").textContent = "starting…";
-      try {
-        await api("POST", "/api/session/capture", {
-          tune: { device_name: $("#cap-device").value, delivery_system: $("#t-delsys").value, frequency_mhz: parseInt($("#t-freq").value, 10), signal_timeout_s: 15 },
-          output: $("#t-out").value, seconds: parseInt($("#t-secs").value, 10) || 0,
-        });
-        $("#btn-cap-terr-stop").disabled = false;
-      } catch (e) { $("#terr-msg").innerHTML = '<span class="err">' + e.message + '</span>'; }
-    };
-    $("#btn-cap-terr-stop").onclick = async () => { await api("DELETE", "/api/session/capture"); $("#btn-cap-terr-stop").disabled = true; $("#terr-msg").textContent = "stopped"; };
-    $("#btn-cap-cable").onclick = async () => {
-      $("#cable-msg").textContent = "starting…";
-      try {
-        await api("POST", "/api/session/capture", {
-          tune: { device_name: $("#cap-device").value, delivery_system: $("#c-delsys").value, frequency_mhz: parseInt($("#c-freq").value, 10), symbol_rate_ksps: parseInt($("#c-sr").value, 10), modulation: $("#c-mod").value, signal_timeout_s: 15 },
-          output: $("#c-out").value, seconds: parseInt($("#c-secs").value, 10) || 0,
-        });
-        $("#btn-cap-cable-stop").disabled = false;
-      } catch (e) { $("#cable-msg").innerHTML = '<span class="err">' + e.message + '</span>'; }
-    };
-    $("#btn-cap-cable-stop").onclick = async () => { await api("DELETE", "/api/session/capture"); $("#btn-cap-cable-stop").disabled = true; $("#cable-msg").textContent = "stopped"; };
-
-    // ---------- satellite DB ----------
-    async function loadSatSelect() {
-      try {
-        const db = await api("GET", "/api/satellites");
-        stateData.satellites = db.satellites || [];
-        const cur = $("#sat-select").value;
-        $("#sat-select").innerHTML = stateData.satellites.map((s) =>
-          `<option value="${s.name}">${s.name} (${s.transponders.length} TP)</option>`).join("")
-          || '<option value="">no satellites</option>';
-        if (cur) $("#sat-select").value = cur;
-        renderSatTps();
-      } catch (e) { log("satellites load: " + e.message, true); }
-    }
-    function currentSat() {
-      return stateData.satellites.find((s) => s.name === $("#sat-select").value);
-    }
-    function renderSatTps() {
-      const sat = currentSat();
-      if (!sat) { $("#sat-tp-list").innerHTML = '<p class="muted">No satellite.</p>'; $("#sat-tp-count").textContent = ""; return; }
-      $("#sat-tp-count").textContent = "(" + sat.transponders.length + ")";
-      const rows = sat.transponders.map((t, i) => `<tr>
-        <td class="mono">${t.frequency_mhz} ${t.polarity[0].toUpperCase()}</td>
-        <td>${t.delivery_system}</td><td>${t.modulation}</td><td>${t.symbol_rate_ksps}</td><td>${t.fec}</td>
-        <td><button class="secondary" data-tpedit="${i}">Edit</button> <button class="danger" data-tpdel="${i}">✕</button></td>
-      </tr>`).join("");
-      $("#sat-tp-list").innerHTML = `<table><thead><tr><th>Freq</th><th>Sys</th><th>Mod</th><th>SR</th><th>FEC</th><th></th></tr></thead><tbody>${rows}</tbody></table>`;
-      $("#sat-tp-list").querySelectorAll("[data-tpdel]").forEach((b) => b.onclick = () => delSatTp(parseInt(b.dataset.tpdel, 10)));
-      $("#sat-tp-list").querySelectorAll("[data-tpedit]").forEach((b) => b.onclick = () => editSatTp(parseInt(b.dataset.tpedit, 10)));
-    }
-    $("#sat-select").onchange = renderSatTps;
-
-    async function saveSat(sat) { await api("POST", "/api/satellites", sat); await loadSatSelect(); }
-
-    $("#btn-sat-add").onclick = () => openSatEditor(null);
-    $("#btn-sat-edit").onclick = () => { const s = currentSat(); if (s) openSatEditor(s); };
-    function openSatEditor(sat) {
-      $("#sat-editor").style.display = "block";
-      $("#sat-editor-title").textContent = sat ? "Edit satellite" : "Add satellite";
-      $("#se-name").value = sat ? sat.name : "";
-      $("#se-lon").value = sat ? sat.longitude : "";
-      $("#se-lnb").value = sat ? sat.lnb : "universal";
-      $("#se-diseqc").value = sat ? sat.diseqc : 0;
-      $("#se-name").dataset.editing = sat ? sat.name : "";
-    }
-    $("#btn-sat-cancel").onclick = () => { $("#sat-editor").style.display = "none"; };
-    $("#btn-sat-save").onclick = async () => {
-      const editing = $("#se-name").dataset.editing;
-      const existing = editing ? stateData.satellites.find((s) => s.name === editing) : null;
-      const sat = {
-        name: $("#se-name").value.trim(),
-        longitude: $("#se-lon").value.trim(),
-        lnb: $("#se-lnb").value,
-        diseqc: parseInt($("#se-diseqc").value, 10) || 0,
-        transponders: existing ? existing.transponders : [],
-      };
-      if (!sat.name) return;
-      try {
-        if (editing && editing !== sat.name) await api("DELETE", "/api/satellites/" + encodeURIComponent(editing));
-        await saveSat(sat);
-        $("#sat-editor").style.display = "none";
-        $("#sat-select").value = sat.name;
-        renderSatTps();
-      } catch (e) { log("save satellite: " + e.message, true); }
-    };
-    $("#btn-sat-del").onclick = async () => {
-      const s = currentSat(); if (!s) return;
-      if (!confirm("Remove satellite " + s.name + "?")) return;
-      await api("DELETE", "/api/satellites/" + encodeURIComponent(s.name));
-      await loadSatSelect();
-    };
-
-    $("#btn-kos").onclick = async () => {
-      const pos = $("#kos-pos").value.trim();
-      if (!pos) return;
-      $("#kos-msg").textContent = "importing " + pos + "…";
-      try {
-        const r = await api("POST", "/api/satellites/import", { pos });
-        $("#kos-msg").textContent = "imported " + r.name + " (" + r.transponders + " TPs)";
-        await loadSatSelect();
-        $("#sat-select").value = r.name;
-        renderSatTps();
-      } catch (e) { $("#kos-msg").innerHTML = '<span class="err">' + e.message + '</span>'; }
-    };
-
-    function teBody() {
-      return {
-        frequency_mhz: parseInt($("#te-freq").value, 10),
-        polarity: $("#te-pol").value,
-        symbol_rate_ksps: parseInt($("#te-sr").value, 10),
-        modulation: $("#te-mod").value,
-        fec: $("#te-fec").value,
-        delivery_system: $("#te-delsys").value,
-        name: $("#te-name").value,
-      };
-    }
-    function editSatTp(i) {
-      const sat = currentSat(); if (!sat) return;
-      const t = sat.transponders[i];
-      $("#te-freq").value = t.frequency_mhz; $("#te-pol").value = t.polarity;
-      $("#te-sr").value = t.symbol_rate_ksps; $("#te-delsys").value = t.delivery_system;
-      $("#te-mod").value = t.modulation; $("#te-fec").value = t.fec; $("#te-name").value = t.name || "";
-      $("#te-index").value = i;
-    }
-    $("#btn-tp-clear").onclick = () => { $("#te-index").value = -1; ["te-freq","te-sr","te-name"].forEach(id=>$("#"+id).value=""); };
-    $("#btn-tp-save").onclick = async () => {
-      const sat = currentSat(); if (!sat) return;
-      const idx = parseInt($("#te-index").value, 10);
-      const tp = teBody();
-      if (!tp.frequency_mhz) return;
-      if (idx >= 0) sat.transponders[idx] = tp; else sat.transponders.push(tp);
-      await saveSat(sat);
-      $("#sat-select").value = sat.name;
-      $("#te-index").value = -1;
-      renderSatTps();
-    };
-    async function delSatTp(i) {
-      const sat = currentSat(); if (!sat) return;
-      sat.transponders.splice(i, 1);
-      await saveSat(sat);
-      $("#sat-select").value = sat.name;
-      renderSatTps();
-    }
-
-    $("#btn-sat-cap").onclick = async () => {
-      const sat = currentSat(); if (!sat || !$("#cap-device").value) return;
-      $("#sat-cap-msg").textContent = "starting…";
-      try {
-        await api("POST", "/api/session/capture-sat", {
-          device_name: $("#cap-device").value, satellite: sat.name,
-          seconds: parseInt($("#sat-secs").value, 10) || 10, signal_timeout_s: 15,
-        });
-        $("#btn-sat-cap-stop").disabled = false;
-      } catch (e) { $("#sat-cap-msg").innerHTML = '<span class="err">' + e.message + '</span>'; }
-    };
-    $("#btn-sat-cap-stop").onclick = async () => {
-      await api("DELETE", "/api/session/capture-sat");
-      $("#btn-sat-cap-stop").disabled = true;
-      $("#sat-cap-msg").textContent = "stopped";
-    };
-
-    // ============ TS PLAYBACK ============
-    async function onPlaybackOpen() {
-      try {
-        const c = await api("GET", "/api/captures");
-        $("#pb-file").innerHTML = '<option value="">— select capture —</option>' +
-          (c.files || []).map((f) => `<option value="${f}">${f}</option>`).join("");
-      } catch (e) { log("captures: " + e.message, true); }
-      try {
-        const r = await api("GET", "/api/reference-captures");
-        const caps = r.captures || [];
-        $("#pb-ref").innerHTML = '<option value="">— none —</option>' +
-          caps.map((c) => `<option value="${c.name}">${c.name}</option>`).join("");
-        $("#pb-ref")._caps = caps;
-      } catch (e) {}
-    }
-    $("#pb-ref").onchange = () => {
-      const caps = $("#pb-ref")._caps || [];
-      const c = caps.find((x) => x.name === $("#pb-ref").value);
-      if (!c) return;
-      $("#pb-file").value = c.file; $("#pb-freq").value = c.frequency_mhz;
-      $("#pb-mod").value = c.modulation; $("#pb-sr").value = c.symbol_rate_ksps;
-      $("#pb-cr").value = c.code_rate; if (c.level != null) $("#pb-level").value = c.level;
-    };
-    $("#btn-pb-ref-del").onclick = async () => {
-      const n = $("#pb-ref").value; if (!n) return;
-      await api("DELETE", "/api/reference-captures/" + encodeURIComponent(n));
-      onPlaybackOpen();
-    };
-    function playoutBody() {
-      const lvl = $("#pb-level").value.trim();
-      return {
-        file: $("#pb-file").value, frequency_mhz: parseInt($("#pb-freq").value, 10),
-        modulation: $("#pb-mod").value, symbol_rate_ksps: parseInt($("#pb-sr").value, 10),
-        code_rate: $("#pb-cr").value, level: lvl ? parseInt(lvl, 10) : null,
-        infinite: $("#pb-inf").checked,
-      };
-    }
-    $("#btn-pb-play").onclick = async () => {
-      if (!$("#pb-file").value) { $("#pb-msg").textContent = "select a TS file"; return; }
-      $("#pb-msg").textContent = "starting playout…";
-      try {
-        await api("POST", "/api/session/playout", playoutBody());
-        $("#btn-pb-stop").disabled = false;
-        $("#pb-msg").textContent = "playing out";
-      } catch (e) { $("#pb-msg").innerHTML = '<span class="err">' + e.message + '</span>'; }
-    };
-    $("#btn-pb-stop").onclick = async () => { await api("DELETE", "/api/session/playout"); $("#btn-pb-stop").disabled = true; $("#pb-msg").textContent = "stopped"; };
-    $("#btn-pb-save").onclick = async () => {
-      const name = $("#pb-save-name").value.trim();
-      if (!name || !$("#pb-file").value) { $("#pb-save-msg").textContent = "name + file required"; return; }
-      const b = playoutBody(); b.name = name;
-      try { await api("POST", "/api/reference-captures", b); $("#pb-save-msg").textContent = "saved"; onPlaybackOpen(); }
-      catch (e) { $("#pb-save-msg").innerHTML = '<span class="err">' + e.message + '</span>'; }
-    };
-
-    // ============ WATCH TV ============
-    function showWatchScanMode() {
-      $("#watch-empty").style.display = "none";
-      $("#watch-main").style.display = "block";
-      setWatchMode("scan");
-    }
-    function setWatchMode(mode) {
-      const hasChannels = stateData.channels.length > 0;
-      $("#watch-mode-tabs").querySelectorAll(".tab").forEach((t) => {
-        const isWatch = t.dataset.wmode === "watch";
-        t.style.display = !hasChannels && isWatch ? "none" : "";
-        t.classList.toggle("active", t.dataset.wmode === mode);
-      });
-      $("#watch-mode-scan").classList.toggle("active", mode === "scan");
-      $("#watch-mode-watch").classList.toggle("active", mode === "watch");
-      if (mode === "watch") renderChannelList();
-    }
-    function renderWatchShell() {
-      const hasChannels = stateData.channels.length > 0;
-      if (hasChannels) {
-        $("#watch-empty").style.display = "none";
-        const opening = $("#watch-main").style.display !== "block";
-        $("#watch-main").style.display = "block";
-        if (opening) setWatchMode("watch");
-        else if ($("#watch-mode-watch").classList.contains("active")) renderChannelList();
-      } else if ($("#watch-main").style.display === "block") {
-        $("#watch-empty").style.display = "none";
-        setWatchMode("scan");
-      } else {
-        $("#watch-empty").style.display = "block";
-        $("#watch-main").style.display = "none";
-      }
-    }
-    async function loadChannels() {
-      try {
-        const db = await api("GET", "/api/channels");
-        stateData.channels = db.channels || [];
-      } catch (e) {
-        stateData.channels = [];
-        log("channels load: " + e.message, true);
-      }
-      renderWatchShell();
-    }
-    function onWatchOpen() { loadRefTpSelect(); loadChannels(); }
-    $("#btn-watch-start-scan").onclick = showWatchScanMode;
-    bindTabs($("#watch-mode-tabs"), "wmode", setWatchMode);
-    bindTabs($("#watch-scan-delivery-tabs"), "scanDel", (del) => {
-      watchScanDelivery = del;
-      ["satellite", "terrestrial", "cable"].forEach((d) =>
-        $("#scan-pane-" + d).classList.toggle("active", d === del));
-    });
-    bindTabs($("#watch-list-delivery-tabs"), "listDel", (del) => {
-      watchListDelivery = del;
-      renderChannelList();
-    });
-    function watchTuneBody() {
-      const t = stateData.refTps[parseInt($("#w-tp").value, 10)];
-      const dev = $("#w-device").value;
-      const diseqc = parseInt($("#w-diseqc").value, 10) || 0;
-      if (!t) throw new Error("no transponder");
-      return {
-        device_name: dev, satellite_number: diseqc, signal_timeout_s: 15,
-        delivery_system: t.delivery_system, frequency_mhz: t.frequency_mhz,
-        polarity: t.polarity, symbol_rate_ksps: t.symbol_rate_ksps,
-        modulation: t.modulation, fec: t.fec,
-      };
-    }
-    $("#btn-tune").onclick = async () => {
-      if (!$("#w-device").value) return;
-      $("#tune-msg").textContent = "tuning…";
-      try { await api("POST", "/api/session/tune", watchTuneBody()); $("#tune-msg").textContent = "monitoring"; $("#btn-tune-stop").disabled = false; }
-      catch (e) { $("#tune-msg").innerHTML = '<span class="err">' + e.message + '</span>'; }
-    };
-    $("#btn-tune-stop").onclick = async () => { await api("DELETE", "/api/session/tune"); $("#tune-msg").textContent = "stopped"; $("#btn-tune-stop").disabled = true; };
-    $("#btn-scan").onclick = async () => {
-      if (!$("#w-device").value) return;
-      $("#tune-msg").textContent = "NIT scan…";
-      try { await api("POST", "/api/session/scan", watchTuneBody()); $("#btn-scan-stop").disabled = false; }
-      catch (e) { $("#tune-msg").innerHTML = '<span class="err">' + e.message + '</span>'; }
-    };
-    $("#btn-scan-stop").onclick = async () => { await api("DELETE", "/api/session/scan"); $("#btn-scan-stop").disabled = true; };
-    $("#btn-save-channels").onclick = async () => {
-      $("#save-ch-msg").textContent = "saving…";
-      try {
-        const r = await api("POST", "/api/channels", {
-          delivery: watchScanDelivery, tune: watchTuneBody(), replace: $("#ch-replace").checked,
-        });
-        $("#save-ch-msg").textContent = "saved " + r.added + " channel(s)";
-        await loadChannels();
-        setWatchMode("watch");
-      } catch (e) { $("#save-ch-msg").innerHTML = '<span class="err">' + e.message + '</span>'; }
-    };
-    function tuneBodyFromChannel(ch) {
-      return {
-        device_name: ch.device_name, satellite_number: ch.satellite_number || 0,
-        signal_timeout_s: 15, delivery_system: ch.delivery_system,
-        frequency_mhz: ch.frequency_mhz, polarity: ch.polarity,
-        symbol_rate_ksps: ch.symbol_rate_ksps, modulation: ch.modulation, fec: ch.fec,
-      };
-    }
-
-    function updateSignal(s) {
-      $("#m-lock").innerHTML = s.locked ? '<span class="pill lock-yes">LOCKED</span>' : '<span class="pill lock-no">NO LOCK</span>';
-      $("#m-snr").textContent = s.snr_db != null ? s.snr_db.toFixed(1) + " dB" : "—";
-      $("#m-str").textContent = s.strength_db != null ? s.strength_db.toFixed(1) + " dB" : "—";
-      $("#m-ber").textContent = s.ber || "—";
-    }
-    function renderServices(svcs) {
-      if (!svcs || !svcs.length) { $("#services").innerHTML = '<p class="muted">No services yet.</p>'; return; }
-      const rows = svcs.map((s) => `<tr>
-        <td>${s.name || "(unnamed)"}</td><td class="mono">${s.id}</td><td>${s.provider}</td>
-        <td>${s.scrambled ? "scrambled" : "FTA"}</td>
-        <td>${s.scrambled ? "" : `<button type="button" class="secondary" data-sid="${s.id}">Play</button>`}</td></tr>`).join("");
-      $("#services").innerHTML = `<table><thead><tr><th>Service</th><th>ID</th><th>Provider</th><th>Access</th><th></th></tr></thead><tbody>${rows}</tbody></table>`;
-    }
-    $("#services").addEventListener("click", (e) => {
-      const btn = e.target.closest("button[data-sid]");
-      if (btn) playService(parseInt(btn.dataset.sid, 10), watchTuneBody());
-    });
-    function renderChannelList() {
-      const list = stateData.channels
-        .filter((c) => c.delivery === watchListDelivery && !c.scrambled)
-        .sort((a, b) => a.scan_index - b.scan_index);
-      if (!list.length) {
-        $("#channel-list").innerHTML = '<p class="muted">No channels for this delivery.</p>';
-        return;
-      }
-      $("#channel-list").innerHTML = list.map((ch) =>
-        `<button type="button" class="channel-item${selectedChannelId === ch.id ? " active" : ""}" data-chid="${ch.id}">
-          <div class="ch-name">${ch.name || "(unnamed)"}</div>
-          <div class="ch-meta">${ch.provider || "—"} · ${ch.frequency_mhz || "?"} MHz · id ${ch.service_id}</div>
-        </button>`).join("");
-      $("#channel-list").querySelectorAll(".channel-item").forEach((btn) => {
-        btn.onclick = () => {
-          selectedChannelId = parseInt(btn.dataset.chid, 10);
-          renderChannelList();
-          const ch = stateData.channels.find((c) => c.id === selectedChannelId);
-          if (ch) playChannel(ch);
-        };
-      });
-    }
-    function renderScan(tps) {
-      if (!tps || !tps.length) { $("#scan-results").innerHTML = '<p class="muted">No transponders found.</p>'; return; }
-      const rows = tps.map((tp) => {
-        const mhz = (tp.frequency_hz / 1e6).toFixed(0);
-        const lock = tp.locked ? '<span class="pill lock-yes">LOCK</span>' : '<span class="pill lock-no">—</span>';
-        return `<tr><td class="mono">${mhz} MHz ${tp.polarity[0].toUpperCase()}</td><td>${tp.delivery_system || "—"}</td><td>${lock}</td><td>${tp.snr_db != null ? tp.snr_db.toFixed(1) + " dB" : "—"}</td><td class="mono">${tp.ts_id != null ? tp.ts_id : "—"}</td></tr>`;
-      }).join("");
-      $("#scan-results").innerHTML = `<table><thead><tr><th>Frequency</th><th>System</th><th>Lock</th><th>SNR</th><th>TS id</th></tr></thead><tbody>${rows}</tbody></table>`;
-    }
-
-    function hlsManifestPath(serviceId) {
-      return "/hls/s" + serviceId + "/stream.m3u8";
-    }
-    function hlsUrl(base) {
-      const sep = base.includes("?") ? "&" : "?";
-      return base + sep + "t=" + Date.now();
-    }
-    function stopVideo() {
-      const video = $("#player");
-      video.pause();
-      video.removeAttribute("src");
-      video.load();
-    }
-    function resetHlsPlayer() {
-      if (hlsPlayer) { hlsPlayer.destroy(); hlsPlayer = null; }
-      hlsStarting = false;
-      stopVideo();
-    }
-    async function playService(serviceId, tuneBody) {
-      if (!tuneBody.device_name) { $("#play-msg").innerHTML = '<span class="err">select a tuner first</span>'; return; }
-      expectedPlaySid = serviceId;
-      playWaitGen += 1;
-      const myGen = playWaitGen;
-      resetHlsPlayer();
-      setWatchMode("watch");
-      const manifestPath = hlsManifestPath(serviceId);
-      $("#play-msg").textContent = "starting playback (service " + serviceId + ")…";
-      try {
-        const r = await api("POST", "/api/session/play", { tune: tuneBody, service_id: serviceId });
-        if (myGen !== playWaitGen || expectedPlaySid !== serviceId) return;
-        await waitForHls(hlsUrl(r.hls_url || manifestPath), serviceId, myGen);
-      } catch (e) { $("#play-msg").innerHTML = '<span class="err">' + e.message + '</span>'; }
-    }
-    async function playChannel(ch) {
-      $("#now-playing").textContent = "Now playing: " + (ch.name || "service " + ch.service_id);
-      await playService(ch.service_id, tuneBodyFromChannel(ch));
-    }
-    function startHls(url) {
-      const video = $("#player");
-      video.style.display = "block"; video.muted = false;
-      $("#btn-play-stop").disabled = false;
-      if (hlsPlayer) { hlsPlayer.destroy(); hlsPlayer = null; }
-      if (window.Hls && Hls.isSupported()) {
-        log("player: hls.js attaching " + url);
-        hlsPlayer = new Hls({ liveDurationInfinity: true, lowLatencyMode: true, maxBufferLength: 6, liveSyncDurationCount: 2, manifestLoadingMaxRetry: 8, manifestLoadingRetryDelay: 800 });
-        hlsPlayer.loadSource(url); hlsPlayer.attachMedia(video);
-        hlsPlayer.on(Hls.Events.MANIFEST_PARSED, () => { log("player: manifest parsed"); video.play().catch((e) => log("autoplay blocked: " + e, true)); });
-        hlsPlayer.on(Hls.Events.ERROR, (_, data) => {
-          log("hls.js " + (data.fatal ? "FATAL " : "") + data.type + " / " + data.details, data.fatal);
-          if (!data.fatal) return;
-          if (data.type === Hls.ErrorTypes.NETWORK_ERROR) hlsPlayer.startLoad();
-          else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) hlsPlayer.recoverMediaError();
-          else $("#play-msg").innerHTML = '<span class="err">HLS fatal: ' + (data.details || data.type) + '</span>';
-        });
-      } else if (video.canPlayType("application/vnd.apple.mpegurl")) {
-        video.src = url; video.play().catch(() => {});
-      } else { $("#play-msg").innerHTML = '<span class="err">HLS not supported</span>'; }
-    }
-    async function waitForHls(url, serviceId, gen) {
-      if (gen !== undefined && gen !== playWaitGen) return;
-      if (expectedPlaySid !== null && serviceId !== expectedPlaySid) return;
-      resetHlsPlayer();
-      hlsStarting = true;
-      go("watch");
-      $("#watch-empty").style.display = "none";
-      $("#watch-main").style.display = "block";
-      setWatchMode("watch");
-      const video = $("#player"); video.style.display = "block";
-      $("#btn-play-stop").disabled = false;
-      $("#play-msg").textContent = "waiting for stream (service " + serviceId + ")…";
-      const manifestBase = url.split("?")[0];
-      for (let i = 0; i < 45; i++) {
-        if (gen !== undefined && gen !== playWaitGen) { hlsStarting = false; return; }
-        if (expectedPlaySid !== null && serviceId !== expectedPlaySid) { hlsStarting = false; return; }
-        try {
-          const bust = hlsUrl(manifestBase);
-          const r = await fetch(bust, { method: "HEAD", cache: "no-store" });
-          if (r.ok) {
-            $("#play-msg").textContent = "playing service " + serviceId;
-            startHls(bust);
-            hlsStarting = false;
-            return;
-          }
-        } catch (_) {}
-        await new Promise((r) => setTimeout(r, 1000));
-      }
-      hlsStarting = false;
-      if (gen === undefined || gen === playWaitGen) {
-        $("#play-msg").innerHTML = '<span class="err">stream did not start in 45 s</span>';
-      }
-    }
-    $("#btn-play-stop").onclick = async () => {
-      expectedPlaySid = null;
-      playWaitGen += 1;
-      await api("DELETE", "/api/session/play");
-      resetHlsPlayer();
-      const video = $("#player"); video.style.display = "none";
-      $("#play-msg").textContent = "stopped"; $("#now-playing").textContent = ""; $("#btn-play-stop").disabled = true;
-    };
-
-    // ---------- status fan-out ----------
-    function updateStatus(st) {
-      $("#btn-tune-stop").disabled = !st.tuning;
-      $("#btn-cap-stop").disabled = !st.capturing;
-      $("#btn-scan-stop").disabled = !st.scanning;
-      $("#btn-play-stop").disabled = !st.playing;
-      $("#btn-pb-stop").disabled = !st.playout;
-      $("#btn-sat-cap-stop").disabled = !st.sat_capturing;
-      if (st.capturing && !st.sat_capturing) {
-        $("#cap-msg").textContent = "capturing…";
-      } else if (wasCapturing && !st.capturing && !st.sat_capturing) {
-        const out = st.capture_output || "";
-        const base = out ? out.replace(/^.*[/\\]/, "") : "";
-        $("#cap-msg").textContent = base ? "saved " + base : "capture finished";
-      }
-      wasCapturing = st.capturing;
-      if (st.signal) updateSignal(st.signal);
-      if (st.services && st.services.length) renderServices(st.services);
-      if (st.scan_results && st.scan_results.length) renderScan(st.scan_results);
-      if (st.sat_capturing && st.sat_progress) $("#sat-cap-msg").textContent = "capturing TP " + st.sat_progress;
-      else if (!st.sat_capturing && $("#sat-cap-msg").textContent.startsWith("capturing")) $("#sat-cap-msg").textContent = "done";
-      if (st.playout) $("#pb-msg").textContent = "playing out " + (st.playout_file || "");
-    }
-
-    // ---------- settings ----------
-    async function loadConfig() {
-      try {
-        const c = await api("GET", "/api/config");
-        $("#cfg-capture-dir").value = c.capture_dir || "";
-        $("#cfg-file").textContent = c.config_file || "—";
-        $("#cfg-log").textContent = c.log_file || "—";
-      } catch (e) {}
-    }
-    $("#btn-cfg-save").onclick = async () => {
-      $("#cfg-msg").textContent = "saving…";
-      try { const c = await api("POST", "/api/config", { capture_dir: $("#cfg-capture-dir").value }); $("#cfg-capture-dir").value = c.capture_dir; $("#cfg-msg").textContent = "saved"; }
-      catch (e) { $("#cfg-msg").innerHTML = '<span class="err">' + e.message + '</span>'; }
-    };
-
-    async function ping() {
-      try { const h = await api("GET", "/api/health"); $("#conn").textContent = h.tsduck_version || "connected"; }
-      catch (e) { $("#conn").textContent = "offline"; }
-    }
-
-    connectWs();
-    ping();
-    loadConfig();
-    refreshDevices();
-    loadRefTpSelect();
-    renderRoute();
-  </script>
+  <script src="/static/hls.js"></script>
+  <script type="module" src="/static/js/main.js"></script>
 </body>
 </html>
