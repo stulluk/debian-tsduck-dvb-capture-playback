@@ -238,6 +238,26 @@ impl SessionManager {
         Ok(cfg)
     }
 
+    /// Sets and persists the browser playback quality.
+    pub async fn set_web_quality(&self, quality: &str) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            crate::config::WEB_QUALITIES.contains(&quality),
+            "web_quality must be one of {:?}",
+            crate::config::WEB_QUALITIES
+        );
+        let cfg = {
+            let mut c = self.config.write().await;
+            c.web_quality = quality.to_string();
+            c.clone()
+        };
+        tokio::task::spawn_blocking(move || cfg.save())
+            .await
+            .map_err(|e| anyhow::anyhow!("config save task failed: {e}"))?
+            .context("failed to persist config")?;
+        self.action(format!("SETTINGS web_quality = {quality}"));
+        Ok(())
+    }
+
     // ---- job slots -----------------------------------------------------
 
     fn new_job(&self, kind: &'static str) -> Job {
@@ -613,11 +633,12 @@ impl SessionManager {
         // segment start cleanly, so playback begins within a few seconds.
         // Audio is AAC (browsers cannot play MPEG-1/2 audio). Only the first
         // video and audio streams are mapped; teletext/data would break the muxer.
+        let quality = self.config.read().await.web_quality.clone();
+        let video = web_video_args(&quality);
         let ffmpeg = format!(
             "ffmpeg -hide_banner -loglevel error -fflags +genpts+discardcorrupt+nobuffer \
              -analyzeduration 1M -probesize 1M -i pipe:0 -map 0:v:0 -map 0:a:0? \
-             -vf yadif=0:-1:0,scale=-2:720 -c:v libx264 -preset veryfast -tune zerolatency \
-             -g 25 -keyint_min 25 -sc_threshold 0 -b:v 3M -maxrate 3500k -bufsize 6M \
+             {video} -tune zerolatency -g 25 -keyint_min 25 -sc_threshold 0 \
              -c:a aac -b:a 128k -ac 2 -f hls -hls_time 1 -hls_list_size 6 \
              -hls_flags delete_segments+omit_endlist+independent_segments \
              -hls_segment_type fmp4 -hls_fmp4_init_filename init.mp4 {}",
@@ -626,7 +647,7 @@ impl SessionManager {
         args.extend(["-P".into(), "zap".into(), spec.service_id.to_string(), "-O".into(), "fork".into(), ffmpeg]);
         let url = format!("/hls/s{}-{id}/stream.m3u8", spec.service_id);
         self.action(format!(
-            "PLAY start '{}' sid={} on {}",
+            "PLAY start '{}' sid={} quality={quality} on {}",
             spec.name,
             spec.service_id,
             spec.params.device_name.clone().unwrap_or_default()
@@ -851,6 +872,24 @@ fn tp_label(tp: &SatTransponder) -> String {
 
 fn pol_initial(p: &str) -> char {
     p.chars().next().unwrap_or('?').to_ascii_uppercase()
+}
+
+/// ffmpeg video options for a browser playback quality: "720p" (default) or
+/// "source" (native resolution, e.g. 3840x2160 for UHD channels; a 4K50 HEVC
+/// source encodes ~2x faster than real time with x264 superfast). Interlaced
+/// sources are deinterlaced (yadif only touches interlaced frames).
+fn web_video_args(quality: &str) -> String {
+    let (filter, preset, rate, max, buf) = match quality {
+        // The comma inside min() is escaped for ffmpeg; the single quotes keep
+        // the backslash through the shell that tsp's fork output uses.
+        "source" => ("yadif=0:-1:1", "superfast", "16M", "20M", "32M"),
+        _ => (r"yadif=0:-1:1,scale=-2:min(720\,ih)", "veryfast", "3M", "3500k", "6M"),
+    };
+    // 8-bit output: 10-bit sources (UHD HEVC Main 10) would otherwise give High 10
+    // H.264, which browsers do not decode.
+    format!(
+        "-vf '{filter}' -pix_fmt yuv420p -c:v libx264 -preset {preset} -b:v {rate} -maxrate {max} -bufsize {buf}"
+    )
 }
 
 /// Stops a job: cancel flag, SIGTERM to its child, then wait for the task.
@@ -1097,7 +1136,7 @@ async fn file_logger(mut rx: broadcast::Receiver<WsEvent>, path: std::path::Path
 
 #[cfg(test)]
 mod tests {
-    use super::{classify_line, LineKind};
+    use super::{classify_line, web_video_args, LineKind};
 
     #[test]
     fn decoder_chatter_is_not_an_error() {
@@ -1114,6 +1153,16 @@ mod tests {
         assert_eq!(classify_line("* Error: dvb: no input signal lock after 10000 milliseconds"), LineKind::Error);
         assert_eq!(classify_line("* dvb: locked: yes"), LineKind::Log);
         assert_eq!(classify_line("   "), LineKind::Noise);
+    }
+
+    #[test]
+    fn web_quality_profiles() {
+        assert!(web_video_args("720p").contains(r"min(720\,ih)"));
+        assert_eq!(web_video_args("1080p"), web_video_args("720p"));
+        let src = web_video_args("source");
+        assert!(!src.contains("scale"));
+        assert!(src.contains("superfast"));
+        assert_eq!(web_video_args("bogus"), web_video_args("720p"));
     }
 }
 

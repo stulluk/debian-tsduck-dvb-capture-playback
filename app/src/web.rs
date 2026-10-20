@@ -240,6 +240,8 @@ async fn api_config_get(State(state): State<AppState>) -> Response {
         "ok": true,
         "capture_dir": cfg.capture_dir.to_string_lossy(),
         "capture_seconds": cfg.capture_seconds,
+        "web_quality": cfg.web_quality,
+        "web_qualities": crate::config::WEB_QUALITIES,
         "config_file": crate::config::config_file_path().to_string_lossy(),
         "log_file": crate::config::log_file_path().to_string_lossy(),
         "hls_dir": session::hls_root().to_string_lossy(),
@@ -249,19 +251,31 @@ async fn api_config_get(State(state): State<AppState>) -> Response {
 
 #[derive(Deserialize)]
 struct ConfigUpdate {
-    capture_dir: String,
+    capture_dir: Option<String>,
+    web_quality: Option<String>,
 }
 
 async fn api_config_set(State(state): State<AppState>, Json(req): Json<ConfigUpdate>) -> Response {
-    let dir = AppConfig::expand_path(&req.capture_dir);
-    if req.capture_dir.trim().is_empty() {
-        return bad_request("capture_dir cannot be empty");
+    if let Some(q) = &req.web_quality {
+        if let Err(e) = state.sessions.set_web_quality(q).await {
+            return bad_request(e);
+        }
     }
-    match state.sessions.set_capture_dir(dir).await {
-        Ok(cfg) => Json(json!({ "ok": true, "capture_dir": cfg.capture_dir.to_string_lossy() }))
-            .into_response(),
-        Err(e) => bad_request(e),
+    if let Some(dir) = &req.capture_dir {
+        if dir.trim().is_empty() {
+            return bad_request("capture_dir cannot be empty");
+        }
+        if let Err(e) = state.sessions.set_capture_dir(AppConfig::expand_path(dir)).await {
+            return bad_request(e);
+        }
     }
+    let cfg = state.config.read().await.clone();
+    Json(json!({
+        "ok": true,
+        "capture_dir": cfg.capture_dir.to_string_lossy(),
+        "web_quality": cfg.web_quality,
+    }))
+    .into_response()
 }
 
 #[derive(Deserialize)]

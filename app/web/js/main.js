@@ -124,6 +124,7 @@ async function loadSettings() {
       ["Log file", c.log_file],
       ["HLS working dir (tmpfs)", c.hls_dir],
       ["Default capture length", `${c.capture_seconds} s`],
+      ["Browser playback quality", c.web_quality],
     ]
       .map(([k, v]) => `<tr><td class="muted">${k}</td><td class="mono">${esc(v)}</td></tr>`)
       .join("");

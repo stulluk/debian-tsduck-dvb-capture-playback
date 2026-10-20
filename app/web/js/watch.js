@@ -212,6 +212,17 @@ export function init() {
     renderChannelList();
     stopTuner().catch((e) => toast(e.message, "err"));
   };
+  $("#play-quality").onchange = async () => {
+    const quality = $("#play-quality").value;
+    try {
+      await api("POST", "/api/config", { web_quality: quality });
+      toast(`Browser quality: ${quality}`, "ok");
+      // Restart the running channel so the new quality takes effect now.
+      if (state.status.playing && activeChannel != null) play(activeChannel);
+    } catch (e) {
+      toast(e.message, "err");
+    }
+  };
   $("#scan-start").onclick = async () => {
     $("#scan-rows").innerHTML = "";
     $("#scan-bar").style.width = "0";
@@ -281,6 +292,9 @@ export function init() {
 }
 
 export async function show() {
+  api("GET", "/api/config")
+    .then((c) => ($("#play-quality").value = c.web_quality || "720p"))
+    .catch(() => {});
   try {
     await loadChannels();
   } catch (e) {

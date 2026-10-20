@@ -183,6 +183,9 @@
               <video id="player" controls playsinline></video>
               <div class="row" style="margin-top:8px">
                 <button class="secondary" id="play-stop" disabled>Stop</button>
+                <select id="play-quality" title="Browser playback quality (re-encoded on the server)">
+                  <option value="720p">720p</option><option value="source">Source (native)</option>
+                </select>
                 <span id="play-msg" class="muted"></span>
               </div>
               <div class="metrics" id="play-metrics"></div>

@@ -168,17 +168,28 @@ pub struct AppConfig {
     pub capture_dir: PathBuf,
     #[serde(default = "default_capture_seconds")]
     pub capture_seconds: u32,
+    /// Browser playback quality: "720p" or "source" (native resolution).
+    #[serde(default = "default_web_quality")]
+    pub web_quality: String,
 }
 
 fn default_capture_seconds() -> u32 {
     30
 }
 
+fn default_web_quality() -> String {
+    "720p".into()
+}
+
+/// Accepted values for [`AppConfig::web_quality`].
+pub const WEB_QUALITIES: &[&str] = &["720p", "source"];
+
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
             capture_dir: default_capture_dir(),
             capture_seconds: default_capture_seconds(),
+            web_quality: default_web_quality(),
         }
     }
 }
