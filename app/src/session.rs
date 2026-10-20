@@ -909,14 +909,15 @@ async fn stream_logs(
 ) {
     let mut lines = BufReader::new(reader).lines();
     while let Ok(Some(line)) = lines.next_line().await {
-        if is_noise_line(&line) || line.trim().is_empty() {
+        let kind = classify_line(&line);
+        if kind == LineKind::Noise {
             continue;
         }
         if is_stderr {
             if let Some(sig) = parse_signal_line(&line).or_else(|| parse_dvbstatus_line(&line)) {
                 mgr.push_signal(sig).await;
             }
-            if line.contains("Error") {
+            if kind == LineKind::Error {
                 let msg = match crate::tsduck::explain_error(&line) {
                     Some(hint) => format!("{} — {hint}", line.trim()),
                     None => line.trim().to_string(),
@@ -929,10 +930,25 @@ async fn stream_logs(
     }
 }
 
-/// Decoder chatter while joining a live stream mid-GOP; not real errors.
-fn is_noise_line(line: &str) -> bool {
+/// How a line from a job's output is shown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LineKind {
+    /// Dropped (decoder chatter, blank).
+    Noise,
+    /// Activity log only.
+    Log,
+    /// Activity log + error notification.
+    Error,
+}
+
+/// Classifies tool output. Only TSDuck's own `* Error:` lines and unprefixed
+/// fatal messages are errors. Lines from ffmpeg components (`[hevc @ …]`,
+/// `[aist#0:1/aac @ …]`) are log-only: when a live stream is joined mid-GOP the
+/// decoder reports missing references, and when tsp is stopped the last packet
+/// arrives truncated — neither is a failure.
+fn classify_line(line: &str) -> LineKind {
     let t = line.trim();
-    [
+    const NOISE: &[&str] = &[
         "non-existing PPS",
         "no frame!",
         "sps_id",
@@ -945,9 +961,18 @@ fn is_noise_line(line: &str) -> bool {
         "mmco: unref short failure",
         "reference picture missing",
         "Missing reference picture",
-    ]
-    .iter()
-    .any(|n| t.contains(n))
+        "Error constructing the frame RPS",
+        "Could not find ref with POC",
+        "Error submitting packet to decoder",
+        "Invalid data found when processing input",
+    ];
+    if t.is_empty() || NOISE.iter().any(|n| t.contains(n)) {
+        LineKind::Noise
+    } else if t.starts_with("* Error") || (!t.starts_with('[') && t.contains("Error")) {
+        LineKind::Error
+    } else {
+        LineKind::Log
+    }
 }
 
 /// SIGTERM so `tsp` can flush, then SIGKILL after 5 s.
@@ -1069,3 +1094,26 @@ async fn file_logger(mut rx: broadcast::Receiver<WsEvent>, path: std::path::Path
         let _ = file.flush().await;
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{classify_line, LineKind};
+
+    #[test]
+    fn decoder_chatter_is_not_an_error() {
+        assert_eq!(classify_line("[hevc @ 0x556eb7340b00] Error constructing the frame RPS."), LineKind::Noise);
+        assert_eq!(
+            classify_line("[aist#0:1/aac @ 0x55] [dec:aac @ 0x55] Error submitting packet to decoder: Invalid data found when processing input"),
+            LineKind::Noise
+        );
+        assert_eq!(classify_line("[hevc @ 0x1] VPS 0 does not exist"), LineKind::Log);
+    }
+
+    #[test]
+    fn tsduck_errors_are_errors() {
+        assert_eq!(classify_line("* Error: dvb: no input signal lock after 10000 milliseconds"), LineKind::Error);
+        assert_eq!(classify_line("* dvb: locked: yes"), LineKind::Log);
+        assert_eq!(classify_line("   "), LineKind::Noise);
+    }
+}
+
