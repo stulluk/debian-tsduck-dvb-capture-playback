@@ -23,9 +23,6 @@ libc = "0.2"
 ureq = { version = "2", default-features = false, features = ["tls"] }
 ratatui = "0.29"
 crossterm = "0.28"
-gstreamer = "0.23"
-gstreamer-app = "0.23"
-glib = "0.20"
 
 [dev-dependencies]
 ratatui = { version = "0.29", features = ["all-widgets"] }

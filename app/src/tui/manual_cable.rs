@@ -52,33 +52,6 @@ impl ManualCableForm {
         }
     }
 
-    pub fn from_preset(preset: &CableMux) -> Self {
-        let delivery_sel = DELIVERY
-            .iter()
-            .position(|d| *d == preset.delivery_system.as_str())
-            .unwrap_or(0);
-        let modulation_sel = MODULATIONS
-            .iter()
-            .position(|m| *m == preset.modulation.as_str())
-            .unwrap_or(0);
-        let fec_sel = preset
-            .fec
-            .as_deref()
-            .and_then(|f| FECS.iter().position(|x| *x == f))
-            .unwrap_or(0);
-        Self {
-            label: preset.label.clone(),
-            frequency_mhz: preset.frequency_mhz,
-            symbol_rate_ksps: preset.symbol_rate_ksps,
-            delivery_sel,
-            modulation_sel,
-            fec_sel,
-            sel: 0,
-            editing: None,
-            edit_buffer: String::new(),
-        }
-    }
-
     pub fn to_mux(&self) -> CableMux {
         CableMux {
             label: if self.label.trim().is_empty() {

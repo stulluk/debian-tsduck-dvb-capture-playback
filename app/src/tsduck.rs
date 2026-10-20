@@ -6,10 +6,7 @@
 
 use crate::config::TsduckPaths;
 use anyhow::Context;
-use std::io::{BufRead, BufReader};
-use std::process::{Command, Stdio};
-use std::sync::Arc;
-use std::thread;
+use std::process::Command;
 
 use crate::lastlog;
 
@@ -28,83 +25,6 @@ pub fn run_inherit(paths: &TsduckPaths, tool: &str, args: &[String]) -> anyhow::
         &format!("inherit exit ok={ok} code={}", status.code().unwrap_or(-1)),
     );
     Ok(ok)
-}
-
-/// Like [`run_inherit`] but captures stderr into `on_stderr` while stdout stays inherited.
-pub fn run_inherit_log_stderr<F>(
-    paths: &TsduckPaths,
-    tool: &str,
-    args: &[String],
-    mut on_stderr: F,
-) -> anyhow::Result<(bool, i32)>
-where
-    F: FnMut(&str) + Send + 'static,
-{
-    let bin = paths.tool(tool);
-    let mut child = Command::new(&bin)
-        .args(args)
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::piped())
-        .spawn()
-        .with_context(|| format!("failed to launch {}", bin.display()))?;
-
-    let pid = child.id();
-    if let Some(stderr) = child.stderr.take() {
-        let mut cb = on_stderr;
-        thread::spawn(move || {
-            let reader = BufReader::new(stderr);
-            for line in reader.lines().map_while(Result::ok) {
-                cb(&line);
-            }
-        });
-    }
-
-    let status = child.wait().with_context(|| format!("wait failed pid={pid}"))?;
-    Ok((status.success(), status.code().unwrap_or(-1)))
-}
-
-/// Runs with `--verbose` on stderr logged; mirrors lines to terminal when `mirror` is true.
-pub fn run_inherit_verbose(
-    paths: &TsduckPaths,
-    tool: &str,
-    args: &[String],
-    mirror_stderr: bool,
-    on_stderr: Arc<dyn Fn(&str) + Send + Sync>,
-) -> anyhow::Result<(bool, i32)> {
-    lastlog::event(
-        "tsp",
-        &format!("verbose {}", display_command(tool, args)),
-    );
-    let bin = paths.tool(tool);
-    let mut argv = vec!["--verbose".to_string()];
-    argv.extend(args.iter().cloned());
-    let mut child = Command::new(&bin)
-        .args(&argv)
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::piped())
-        .spawn()
-        .with_context(|| format!("failed to launch {}", bin.display()))?;
-
-    let pid = child.id();
-    if let Some(stderr) = child.stderr.take() {
-        let log = Arc::clone(&on_stderr);
-        thread::spawn(move || {
-            let reader = BufReader::new(stderr);
-            for line in reader.lines().map_while(Result::ok) {
-                log(&line);
-                if mirror_stderr {
-                    eprintln!("tsp: {line}");
-                }
-            }
-        });
-    }
-
-    let status = child
-        .wait()
-        .with_context(|| format!("wait failed pid={pid}"))?;
-    let code = status.code().unwrap_or(-1);
-    lastlog::event("tsp", &format!("verbose exit ok={} code={code}", status.success()));
-    Ok((status.success(), code))
 }
 
 /// Runs a TSDuck tool and captures its stdout as a UTF-8 string.
@@ -185,4 +105,32 @@ pub fn display_command(tool: &str, args: &[String]) -> String {
         }
     }
     line
+}
+
+/// Plain-language hint for well-known TSDuck / DTAPI / tuner error lines.
+pub fn explain_error(line: &str) -> Option<&'static str> {
+    if line.contains("DTAPI_E_EVENT_POWER") {
+        Some(
+            "the DTU-315 lost USB power while modulating — connect it directly to a host \
+             USB port or a powered hub (bus-powered hubs cannot supply it)",
+        )
+    } else if line.contains("no input signal lock") {
+        Some("no signal: check the cable, the tuning parameters, LNB / DiSEqC settings")
+    } else if line.contains("Device or resource busy") {
+        Some("the tuner is in use by another program (another dvbhub, tsp, kaffeine, …)")
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod explain_tests {
+    use super::explain_error;
+
+    #[test]
+    fn explains_dtu_power_loss() {
+        let hint = explain_error("* Error: dektec: error muting modulator output: DTAPI_E_EVENT_POWER (DTAPI status 4230)");
+        assert!(hint.unwrap().contains("USB power"));
+        assert!(explain_error("all good").is_none());
+    }
 }

@@ -79,14 +79,6 @@ pub fn path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(DEFAULT_PATH))
 }
 
-pub fn enabled() -> bool {
-    init();
-    LOG.get()
-        .and_then(|m| m.lock().ok())
-        .map(|s| s.enabled)
-        .unwrap_or(false)
-}
-
 /// One timestamped line: `phase` is a short category (`main`, `tsp`, `watch`, …).
 pub fn event(phase: &str, detail: &str) {
     init();
@@ -151,28 +143,6 @@ pub fn is_tmpfs_mount(path: &Path) -> bool {
         }
     }
     best.is_some_and(|(_, tmpfs)| tmpfs)
-}
-
-/// Returns `fuser` output for a DVB frontend path (empty when free).
-pub fn frontend_holder(frontend: &Path) -> String {
-    let output = std::process::Command::new("fuser").arg(frontend).output();
-    match output {
-        Ok(o) if !o.stdout.is_empty() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
-        Ok(o) if !o.stderr.is_empty() => String::from_utf8_lossy(&o.stderr).trim().to_string(),
-        _ => String::new(),
-    }
-}
-
-/// Best-effort snapshot of watch-related processes.
-pub fn related_process_snapshot() -> String {
-    let output = std::process::Command::new("sh")
-        .arg("-c")
-        .arg("ps -eo pid,cmd 2>/dev/null | rg 'tsp |dvbhub |mpv |ffmpeg ' || true")
-        .output();
-    match output {
-        Ok(o) => String::from_utf8_lossy(&o.stdout).trim().to_string(),
-        Err(_) => String::new(),
-    }
 }
 
 #[cfg(test)]

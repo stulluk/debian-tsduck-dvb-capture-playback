@@ -82,10 +82,6 @@ impl FilePicker {
         }
     }
 
-    pub fn entry_count(&self) -> usize {
-        self.entries.len()
-    }
-
     fn labels(&self) -> Vec<String> {
         self.entries
             .iter()

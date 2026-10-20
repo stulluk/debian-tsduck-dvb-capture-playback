@@ -45,23 +45,8 @@ pub struct ManualTerrestrialForm {
 
 impl ManualTerrestrialForm {
     /// Defaults aligned with Istanbul CH26 / RTÜK national plan.
-    pub fn new_default() -> Self {
-        Self {
-            label: String::new(),
-            frequency_mhz: 618,
-            delivery_sel: 0,
-            bandwidth_sel: 0,
-            guard_sel: 0,
-            plp: 0,
-            modulation_sel: 0,
-            fec_sel: 4, // auto (not sent to tsp for terrestrial)
-            sel: 0,
-            editing: None,
-            edit_buffer: String::new(),
-        }
-    }
-
-    /// Seed the form from a catalogue preset (user may still edit before start).
+    /// Pre-fills the form from a mux preset (test helper).
+    #[cfg(test)]
     pub fn from_preset(preset: &TerrestrialMux) -> Self {
         let delivery_sel = if preset.delivery_system.eq_ignore_ascii_case("DVB-T") {
             1
@@ -95,6 +80,22 @@ impl ManualTerrestrialForm {
             plp: preset.plp.unwrap_or(0),
             modulation_sel,
             fec_sel,
+            sel: 0,
+            editing: None,
+            edit_buffer: String::new(),
+        }
+    }
+
+    pub fn new_default() -> Self {
+        Self {
+            label: String::new(),
+            frequency_mhz: 618,
+            delivery_sel: 0,
+            bandwidth_sel: 0,
+            guard_sel: 0,
+            plp: 0,
+            modulation_sel: 0,
+            fec_sel: 4, // auto (not sent to tsp for terrestrial)
             sel: 0,
             editing: None,
             edit_buffer: String::new(),

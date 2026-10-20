@@ -4,9 +4,7 @@
 # Default source: <repo>/build/dvbhub
 # Default destination: /usr/local/bin/dvbhub
 #
-# Also installs:
-#   - bash completion into /etc/bash_completion.d/dvbhub (if writable)
-#   - optional GStreamer plugins from build/gst-plugins -> /usr/local/lib/dvbhub/gst-plugins
+# Also installs bash completion into /etc/bash_completion.d/dvbhub.
 #
 # Usage:
 #   sudo ./scripts/install-dvbhub-systemwide.sh
@@ -20,7 +18,6 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 SRC="${1:-${REPO_ROOT}/build/dvbhub}"
 DEST_BIN="${DVBHUB_SYSTEM_BIN:-/usr/local/bin/dvbhub}"
-DEST_GST="${DVBHUB_SYSTEM_GST:-/usr/local/lib/dvbhub/gst-plugins}"
 COMPLETION_DIR="${DVBHUB_COMPLETION_DIR:-/etc/bash_completion.d}"
 
 [[ "$(id -u)" -eq 0 ]] || {
@@ -51,12 +48,9 @@ if command -v "${DEST_BIN}" >/dev/null; then
   fi
 fi
 
-# Optional GStreamer plugin dir used by watch path
-if [[ -d "${REPO_ROOT}/build/gst-plugins" ]]; then
-  install -d "${DEST_GST}"
-  cp -a "${REPO_ROOT}/build/gst-plugins/." "${DEST_GST}/"
-  echo "Installed GStreamer plugins: ${DEST_GST}"
-fi
+# Remove the GStreamer plugin dir installed by older versions (no longer used).
+rm -rf /usr/local/lib/dvbhub/gst-plugins
+rmdir /usr/local/lib/dvbhub 2>/dev/null || true
 
 # Make TSDuck tools visible on the default PATH (including sudo secure_path).
 if [[ -x /opt/tsduck/tsp ]]; then
@@ -83,14 +77,14 @@ echo "Installed /etc/profile.d/dvbhub.sh"
 missing=0
 for dep in \
   "dvb-fe-tool:dvb-tools:C/N + post-BER statistics during capture" \
-  "mpv:mpv:default player for dvbhub watch" \
-  "gst-launch-1.0:gstreamer1.0-tools:GStreamer watch path"; do
+  "mpv:mpv:default player for dvbhub watch (vlc also works)" \
+  "ffmpeg:ffmpeg:web UI HLS playback and watch --test"; do
   IFS=: read -r tool pkg purpose <<<"${dep}"
   if ! command -v "${tool}" >/dev/null 2>&1; then
     echo "WARNING: ${tool} not found (${purpose}) — install: apt install ${pkg}" >&2
     missing=1
   fi
 done
-[[ "${missing}" -eq 0 ]] && echo "Runtime dependencies: OK (dvb-fe-tool, mpv, gst-launch-1.0)"
+[[ "${missing}" -eq 0 ]] && echo "Runtime dependencies: OK (dvb-fe-tool, mpv, ffmpeg)"
 
 echo "System-wide dvbhub is ready (PATH should include $(dirname "${DEST_BIN}"))."

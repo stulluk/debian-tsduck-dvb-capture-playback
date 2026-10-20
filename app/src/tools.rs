@@ -32,35 +32,6 @@ pub fn is_executable(path: &Path) -> bool {
     }
 }
 
-/// Verifies the media player referenced by `watch --player` exists on `$PATH`.
-pub fn ensure_watch_player(player_cmd: &str) -> anyhow::Result<()> {
-    let prog = player_cmd
-        .split_whitespace()
-        .next()
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| anyhow::anyhow!("empty --player command"))?;
-
-    if find_executable_on_path(prog).is_some() {
-        return Ok(());
-    }
-
-    let has_mpv = find_executable_on_path("mpv").is_some();
-    let has_vlc = find_executable_on_path("vlc").is_some();
-
-    if has_mpv || has_vlc {
-        anyhow::bail!(
-            "media player '{prog}' not found on $PATH.\n\
-             Install it or pass e.g. --player 'mpv --force-window=yes --title=dvbhub -' \
-             or --player 'vlc -'"
-        );
-    }
-
-    anyhow::bail!(
-        "neither mpv nor vlc found on $PATH — `dvbhub watch` will not work.\n\
-         Install one:  apt install mpv   or   apt install vlc"
-    );
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
