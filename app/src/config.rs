@@ -213,10 +213,6 @@ impl AppConfig {
         }
     }
 
-    pub fn hls_dir(&self) -> PathBuf {
-        self.capture_dir.join("hls")
-    }
-
     pub fn expand_path(path: &str) -> PathBuf {
         let trimmed = path.trim();
         if let Some(rest) = trimmed.strip_prefix("~/") {

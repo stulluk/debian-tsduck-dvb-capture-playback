@@ -1237,6 +1237,10 @@ fn start_terrestrial_worker(
                         services_display_lines(summary),
                     )));
                 }
+                let _ = tx.send(WorkerMsg::Progress(CaptureEvent::Log(saved_paths_line(
+                    &out.ts_path,
+                    &out.services_path,
+                ))));
             }
             Err(e) => {
                 fail += 1;
@@ -1335,6 +1339,10 @@ fn start_cable_worker(
                         services_display_lines(summary),
                     )));
                 }
+                let _ = tx.send(WorkerMsg::Progress(CaptureEvent::Log(saved_paths_line(
+                    &out.ts_path,
+                    &out.services_path,
+                ))));
             }
             Err(e) => {
                 fail += 1;
@@ -1458,6 +1466,10 @@ fn spawn_capture_worker(
                             services_display_lines(summary),
                         )));
                     }
+                    let _ = tx.send(WorkerMsg::Progress(CaptureEvent::Log(saved_paths_line(
+                        &out.ts_path,
+                        &out.services_path,
+                    ))));
                 }
                 Err(e) => {
                     fail += 1;
@@ -1469,6 +1481,15 @@ fn spawn_capture_worker(
         let _ = tx.send(WorkerMsg::Finished { ok, fail });
     });
     Ok(())
+}
+
+/// Log line naming the files a finished capture wrote.
+fn saved_paths_line(ts: &std::path::Path, services: &std::path::Path) -> String {
+    if services.is_file() {
+        format!("Saved {} (+ {})", ts.display(), services.file_name().unwrap_or_default().to_string_lossy())
+    } else {
+        format!("Saved {}", ts.display())
+    }
 }
 
 #[cfg(test)]

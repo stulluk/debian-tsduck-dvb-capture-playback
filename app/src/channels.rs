@@ -7,9 +7,10 @@
 use serde::{Deserialize, Serialize};
 
 /// Delivery category for a saved channel.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum ChannelDelivery {
+    #[default]
     Satellite,
     Terrestrial,
     Cable,
@@ -26,7 +27,7 @@ impl ChannelDelivery {
 }
 
 /// A user-saved channel discovered during scanning.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SavedChannel {
     pub id: u64,
     pub delivery: ChannelDelivery,
@@ -36,7 +37,18 @@ pub struct SavedChannel {
     pub scrambled: bool,
     /// Order in which the channel was saved (lower = earlier in the list).
     pub scan_index: u32,
+    /// Tuner path at scan time. Informational only: adapter numbers change
+    /// with plug order, so playback picks a tuner by delivery (+ model).
     pub device_name: Option<String>,
+    /// Model of the tuner that found the channel (e.g. "TBS5530"); preferred on playback.
+    #[serde(default)]
+    pub tuner_model: Option<String>,
+    /// Satellite catalogue name (satellite channels).
+    #[serde(default)]
+    pub satellite: Option<String>,
+    /// `tsp --lnb` value (satellite channels; `None` = TSDuck default "Extended").
+    #[serde(default)]
+    pub lnb: Option<String>,
     pub delivery_system: Option<String>,
     pub frequency_mhz: Option<u32>,
     pub polarity: Option<String>,
@@ -84,6 +96,33 @@ impl ChannelDb {
         std::fs::write(&path, text)
     }
 
+    /// Finds a channel by exact name, else by a unique case-insensitive match.
+    pub fn find_by_name(&self, name: &str) -> anyhow::Result<SavedChannel> {
+        let needle = name.trim();
+        if let Some(ch) = self.channels.iter().find(|c| c.name == needle) {
+            return Ok(ch.clone());
+        }
+        let lower = needle.to_ascii_lowercase();
+        let exact: Vec<_> = self
+            .channels
+            .iter()
+            .filter(|c| c.name.to_ascii_lowercase() == lower)
+            .collect();
+        let matches = if exact.is_empty() {
+            self.channels
+                .iter()
+                .filter(|c| c.name.to_ascii_lowercase().contains(&lower))
+                .collect()
+        } else {
+            exact
+        };
+        match matches.as_slice() {
+            [] => anyhow::bail!("channel not found in channels.json: {needle:?}"),
+            [one] => Ok((*one).clone()),
+            many => anyhow::bail!("ambiguous channel name {needle:?} ({} matches)", many.len()),
+        }
+    }
+
     /// Returns channels for a delivery type, sorted by scan order.
     pub fn for_delivery(&self, delivery: &ChannelDelivery) -> Vec<&SavedChannel> {
         let mut list: Vec<_> = self
@@ -103,6 +142,8 @@ impl ChannelDb {
                 c.delivery == ch.delivery
                     && c.service_id == ch.service_id
                     && c.frequency_mhz == ch.frequency_mhz
+                    && c.polarity == ch.polarity
+                    && c.satellite == ch.satellite
             });
             if dup {
                 continue;
@@ -134,13 +175,6 @@ impl ChannelDb {
         }
     }
 
-    /// Clears all channels for one delivery type.
-    pub fn clear_delivery(&mut self, delivery: &ChannelDelivery) -> usize {
-        let before = self.channels.len();
-        self.channels.retain(|c| &c.delivery != delivery);
-        before - self.channels.len()
-    }
-
     /// All channels sorted by scan order.
     pub fn sorted_all(&self) -> Vec<&SavedChannel> {
         let mut list: Vec<_> = self.channels.iter().collect();
@@ -150,7 +184,10 @@ impl ChannelDb {
 
     /// Count of channels per delivery type.
     pub fn count_for(&self, delivery: &ChannelDelivery) -> usize {
-        self.channels.iter().filter(|c| &c.delivery == delivery).count()
+        self.channels
+            .iter()
+            .filter(|c| &c.delivery == delivery)
+            .count()
     }
 }
 
@@ -174,8 +211,9 @@ impl SavedChannel {
                     .and_then(|p| p.chars().next())
                     .map(|c| c.to_ascii_uppercase())
                     .unwrap_or('?');
+                let sat = self.satellite.as_deref().map(|s| format!("{s} ")).unwrap_or_default();
                 format!(
-                    "{} {} {} {}  sid={}",
+                    "{sat}{} {} {} {}  sid={}",
                     self.frequency_mhz.unwrap_or(0),
                     pol,
                     self.symbol_rate_ksps.unwrap_or(0),
@@ -205,8 +243,9 @@ impl SavedChannel {
 
     /// Full list row: `[SAT] Kanal D          618 MHz DVB-T2 …`
     pub fn list_label(&self) -> String {
-        let name = if self.name.len() > 28 {
-            format!("{}…", &self.name[..27])
+        // Truncate by characters: names are UTF-8 (Polish, Turkish, …).
+        let name = if self.name.chars().count() > 28 {
+            format!("{}…", self.name.chars().take(27).collect::<String>())
         } else {
             self.name.clone()
         };
@@ -240,7 +279,10 @@ impl SavedChannel {
             symbol_rate: self.symbol_rate_ksps.map(|s| s as u64 * 1_000),
             modulation: self.modulation.clone(),
             fec: self.fec.clone(),
-            lnb: None,
+            lnb: match self.delivery {
+                ChannelDelivery::Satellite => self.lnb.clone(),
+                _ => None,
+            },
             satellite_number: self.satellite_number,
             bandwidth_hz: self.bandwidth_mhz.map(|b| b as u64 * 1_000_000),
             guard_interval: self.guard_interval.clone(),
@@ -251,5 +293,67 @@ impl SavedChannel {
             output: String::new(),
             live_analyze: false,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn list_label_truncates_utf8_names_without_panicking() {
+        let ch = SavedChannel {
+            name: "Telewizja Polska Łódź Śląsk Żółć Kanał HD".into(),
+            ..Default::default()
+        };
+        let label = ch.list_label();
+        assert!(label.contains("Łódź"));
+        assert!(label.contains('…'));
+    }
+
+    #[test]
+    fn loads_v1_channel_records() {
+        let v1 = r#"{"channels":[{"id":1,"delivery":"satellite","name":"TRT1 HD",
+            "service_id":10601,"provider":"TRT","scrambled":false,"scan_index":1,
+            "device_name":"/dev/dvb/adapter0","delivery_system":"DVB-S2",
+            "frequency_mhz":11054,"polarity":"vertical","symbol_rate_ksps":30000,
+            "modulation":"8-PSK","fec":"3/4","satellite_number":0}]}"#;
+        let db: ChannelDb = serde_json::from_str(v1).unwrap();
+        let ch = &db.channels[0];
+        assert_eq!(ch.satellite, None);
+        assert_eq!(ch.tuner_model, None);
+        assert_eq!(ch.frequency_mhz, Some(11054));
+    }
+
+    #[test]
+    fn satellite_channel_passes_lnb_to_tsp() {
+        let ch = SavedChannel {
+            delivery: ChannelDelivery::Satellite,
+            name: "TVP INFO HD".into(),
+            service_id: 4409,
+            delivery_system: Some("DVB-S2".into()),
+            frequency_mhz: Some(10719),
+            polarity: Some("vertical".into()),
+            symbol_rate_ksps: Some(27500),
+            lnb: Some("Extended".into()),
+            satellite: Some("Hot Bird 13E".into()),
+            ..Default::default()
+        };
+        let args = ch.to_capture_params("/dev/dvb/adapter0:1".into(), 10).unwrap().to_tsp_args();
+        let i = args.iter().position(|a| a == "--lnb").unwrap();
+        assert_eq!(args[i + 1], "Extended");
+        assert!(ch.tune_summary().starts_with("Hot Bird 13E 10719 V"));
+    }
+
+    #[test]
+    fn same_service_on_two_satellites_is_not_a_duplicate() {
+        let mk = |sat: &str| SavedChannel {
+            service_id: 1,
+            frequency_mhz: Some(11000),
+            satellite: Some(sat.into()),
+            ..Default::default()
+        };
+        let mut db = ChannelDb::default();
+        assert_eq!(db.add_batch(vec![mk("A"), mk("B"), mk("A")]), 2);
     }
 }

@@ -68,11 +68,16 @@ impl Satellite {
     /// "Universal" is the *old* variant whose low band starts at 10.8 GHz, so
     /// it rejects TPs such as Hot Bird 10719. Map it to TSDuck's "Extended".
     pub fn tsp_lnb(&self) -> String {
-        if self.lnb.eq_ignore_ascii_case("universal") {
-            "Extended".to_string()
-        } else {
-            self.lnb.clone()
-        }
+        tsp_lnb_value(&self.lnb)
+    }
+}
+
+/// Maps a catalogue LNB token to a `tsp --lnb` value ("universal" → "Extended").
+pub fn tsp_lnb_value(token: &str) -> String {
+    if token.eq_ignore_ascii_case("universal") {
+        "Extended".to_string()
+    } else {
+        token.to_string()
     }
 }
 

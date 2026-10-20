@@ -878,6 +878,7 @@ mod tests {
             delivery_system: "DVB-C".into(),
             modulation: "256-QAM".into(),
             fec: "auto".into(),
+            ..Default::default()
         };
         assert_eq!(
             dektec_modulation_from_tune(&cable).as_deref(),
@@ -890,6 +891,7 @@ mod tests {
             delivery_system: "DVB-T2".into(),
             modulation: "64-QAM".into(),
             fec: "2/3".into(),
+            ..Default::default()
         };
         assert_eq!(
             dektec_modulation_from_tune(&terr).as_deref(),
@@ -920,6 +922,7 @@ mod tests {
             delivery_system: "DVB-S2".into(),
             modulation: "8-PSK".into(),
             fec: "3/4".into(),
+            ..Default::default()
         };
         assert_eq!(
             dektec_modulation_from_tune(&tune).as_deref(),

@@ -39,6 +39,7 @@ fn cable_tune() -> TuneRecord {
         delivery_system: "DVB-C".into(),
         modulation: "256-QAM".into(),
         fec: "auto".into(),
+        ..Default::default()
     }
 }
 
@@ -50,6 +51,7 @@ fn terr_tune() -> TuneRecord {
         delivery_system: "DVB-T2".into(),
         modulation: "64-QAM".into(),
         fec: "2/3".into(),
+        ..Default::default()
     }
 }
 

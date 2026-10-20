@@ -201,7 +201,10 @@ fn saved_channel_from_tune(
         } else {
             Some(tune.fec.clone())
         },
-        satellite_number: None,
+        satellite_number: tune.satellite_number,
+        satellite: tune.satellite.clone(),
+        lnb: tune.lnb.clone(),
+        tuner_model: tune.tuner_model.clone(),
         bandwidth_mhz: if delivery_from_tune(tune) == Some(ChannelDelivery::Terrestrial) {
             Some(8)
         } else {
@@ -217,6 +220,7 @@ fn saved_channel_from_tune(
         } else {
             None
         },
+        ..Default::default()
     }
 }
 
@@ -233,6 +237,7 @@ mod tests {
             delivery_system: "DVB-T2".into(),
             modulation: "64-QAM".into(),
             fec: "2/3".into(),
+            ..Default::default()
         };
         assert_eq!(delivery_from_tune(&tune), Some(ChannelDelivery::Terrestrial));
     }

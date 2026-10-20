@@ -482,6 +482,7 @@ mod tests {
             delivery_system: "DVB-T2".into(),
             modulation: "64-QAM".into(),
             fec: "2/3".into(),
+            ..Default::default()
         };
         let params =
             play_params_from_tune("/tmp/x.ts".into(), &tune, true).expect("DVB-T2 must work");

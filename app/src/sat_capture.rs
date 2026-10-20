@@ -81,7 +81,6 @@ pub struct SatCaptureOptions {
 /// Result of capturing one transponder folder.
 #[derive(Debug)]
 pub struct TpCaptureOutcome {
-    pub tp: SatTransponder,
     pub run: CaptureRun,
     pub ts_path: PathBuf,
     pub services_path: PathBuf,
@@ -130,7 +129,7 @@ pub fn capture_transponder(
         progress::run_capture_progress(paths, &args, seconds, signal_timeout_s)?
     };
 
-    let tune = tune_record_from_tp(tp);
+    let tune = tune_record_from_tp(sat, tp);
     let summary = best_capture_summary(
         paths,
         &ts_path,
@@ -145,7 +144,6 @@ pub fn capture_transponder(
     }
 
     Ok(TpCaptureOutcome {
-        tp: tp.clone(),
         run,
         ts_path,
         services_path,
@@ -186,7 +184,6 @@ pub fn run_sat_capture(
                     );
                 }
                 outcomes.push(TpCaptureOutcome {
-                    tp: tp.clone(),
                     run: CaptureRun {
                         success: true,
                         ever_locked: true,
@@ -327,14 +324,18 @@ fn capture_params_from_sat_tp(
     }
 }
 
-fn tune_record_from_tp(tp: &SatTransponder) -> TuneRecord {
+fn tune_record_from_tp(sat: &Satellite, tp: &SatTransponder) -> TuneRecord {
     TuneRecord {
+        satellite: Some(sat.name.clone()),
+        lnb: Some(sat.tsp_lnb()),
+        satellite_number: Some(sat.diseqc),
         frequency_mhz: tp.frequency_mhz,
         polarity: tp.polarity.clone(),
         symbol_rate_ksps: tp.symbol_rate_ksps,
         delivery_system: tp.delivery_system.clone(),
         modulation: tp.modulation.clone(),
         fec: tp.fec.clone(),
+        ..Default::default()
     }
 }
 

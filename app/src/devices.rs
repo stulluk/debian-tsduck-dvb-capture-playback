@@ -236,6 +236,23 @@ impl Discovery {
         !self.capture_tuners().is_empty()
     }
 
+    /// Picks a tuner for `cat`, preferring one whose label/model matches `model`
+    /// (stable across re-plugging, unlike `/dev/dvb/adapterN`).
+    pub fn tuner_for(&self, cat: DeliveryCategory, model: Option<&str>) -> Option<&DvbDevice> {
+        let wanted = model.map(str::to_ascii_lowercase);
+        wanted
+            .as_deref()
+            .and_then(|m| {
+                self.devices.iter().find(|d| {
+                    d.kind == DeviceKind::Tuner
+                        && d.supports_category(cat)
+                        && (d.label.to_ascii_lowercase().contains(m)
+                            || d.model.to_ascii_lowercase().replace(' ', "").contains(m))
+                })
+            })
+            .or_else(|| self.tuner_for_category(cat))
+    }
+
     /// Picks a tuner for the given delivery category (bench-aware preferences).
     pub fn tuner_for_category(&self, cat: DeliveryCategory) -> Option<&DvbDevice> {
         let supports = |d: &&DvbDevice| {
@@ -261,33 +278,6 @@ impl Discovery {
                 .find(|d| d.label.contains("TBS5530") || d.model.to_lowercase().contains("tbs 5530"))
                 .or_else(|| self.devices.iter().find(supports)),
         }
-    }
-
-    /// Returns the address of a satellite (DVB-S/S2) tuner suitable for a
-    /// loopback re-capture. Prefers the TBS5530 S/S2 frontend (the device wired
-    /// to the DTU-315 output on this bench); otherwise falls back to any tuner
-    /// advertising DVB-S2. Returns `None` if no satellite tuner is usable.
-    pub fn satellite_tuner_address(&self) -> Option<String> {
-        let supports_sat = |d: &&DvbDevice| {
-            d.kind == DeviceKind::Tuner
-                && d.delivery_systems
-                    .iter()
-                    .any(|s| s == "DVB-S2" || s == "DVB-S")
-        };
-        // Prefer the TBS5530 satellite frontend.
-        if let Some(d) = self
-            .devices
-            .iter()
-            .filter(supports_sat)
-            .find(|d| d.label.contains("TBS5530") || d.model.to_lowercase().contains("tbs 5530"))
-        {
-            return Some(d.address.clone());
-        }
-        // Otherwise any satellite-capable tuner.
-        self.devices
-            .iter()
-            .find(supports_sat)
-            .map(|d| d.address.clone())
     }
 
     /// Returns the Linux DVB device name for terrestrial capture on the TBS5530
@@ -369,6 +359,10 @@ fn dektec_delivery_systems(dev: &serde_json::Value) -> Vec<String> {
         ("dvb-s2", "DVB-S2"),
         ("dvb-t", "DVB-T"),
         ("dvb-t2", "DVB-T2"),
+        // TSDuck reports cable QAM annexes under combined keys.
+        ("qam:qam-a:dvb-c", "DVB-C"),
+        ("qam:qam-b", "DVB-C/B"),
+        ("qam:qam-c", "DVB-C/C"),
         ("dvb-c2", "DVB-C2"),
         ("atsc", "ATSC"),
         ("isdb-t", "ISDB-T"),
@@ -533,5 +527,17 @@ mod tests {
             sample_sat().capture_address(DeliveryCategory::Satellite),
             "/dev/dvb/adapter0"
         );
+    }
+
+    #[test]
+    fn dektec_dtu315_flags_include_cable() {
+        let dev = serde_json::json!({ "outputs": [{
+            "dvb-s": true, "dvb-s2": true, "dvb-t": true, "dvb-t2": false, "atsc": true,
+            "qam:qam-a:dvb-c": true, "qam:qam-b": true, "qam:qam-c": true
+        }]});
+        let sys = dektec_delivery_systems(&dev);
+        assert!(sys.contains(&"DVB-C".to_string()), "{sys:?}");
+        assert!(sys.contains(&"DVB-S2".to_string()));
+        assert!(!sys.contains(&"DVB-T2".to_string()));
     }
 }

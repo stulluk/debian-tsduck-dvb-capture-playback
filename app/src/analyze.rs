@@ -12,7 +12,7 @@ use anyhow::Context;
 use serde::{Deserialize, Serialize};
 
 /// One service (program) inside a transport stream.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ServiceInfo {
     /// Service id (program number).
     pub id: u64,
@@ -22,10 +22,78 @@ pub struct ServiceInfo {
     pub provider: String,
     /// True if any component of the service is scrambled.
     pub scrambled: bool,
+    /// DVB service_type from the SDT (1 = TV, 2 = radio, 0x19 = HD TV, …).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_type: Option<u8>,
+    /// PCR PID from the PMT; `None` when the service carries no clock (data,
+    /// or listed in the SDT but currently off air).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pcr_pid: Option<u16>,
+    /// Number of elementary streams/PIDs in the service.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub components: Option<u32>,
+    /// A video elementary stream was seen (from the PID descriptions).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub has_video: Option<bool>,
+    /// An audio elementary stream was seen.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub has_audio: Option<bool>,
+}
+
+/// `(has_video, has_audio)` for a service, from the analyze report's PID table.
+fn media_flags(service: &serde_json::Value, doc: &serde_json::Value) -> (Option<bool>, Option<bool>) {
+    let Some(pids) = doc.get("pids").and_then(|p| p.as_array()) else {
+        return (None, None);
+    };
+    let Some(own) = service.get("pids").and_then(|p| p.as_array()) else {
+        return (None, None);
+    };
+    let own: Vec<u64> = own.iter().filter_map(|v| v.as_u64()).collect();
+    let mut video = false;
+    let mut audio = false;
+    for pid in pids {
+        let Some(id) = pid.get("id").and_then(|i| i.as_u64()) else {
+            continue;
+        };
+        if !own.contains(&id) {
+            continue;
+        }
+        let desc = pid
+            .get("description")
+            .and_then(|d| d.as_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        video |= desc.contains("video");
+        audio |= desc.contains("audio");
+    }
+    (Some(video), Some(audio))
+}
+
+/// Broad service class derived from the DVB `service_type` (EN 300 468 table 87).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ServiceKind {
+    Tv,
+    Radio,
+    Data,
+    Unknown,
+}
+
+impl ServiceInfo {
+    /// TV / radio / data classification of this service.
+    pub fn kind(&self) -> ServiceKind {
+        match self.service_type {
+            Some(0x01 | 0x04 | 0x05 | 0x11 | 0x16..=0x1B | 0x1F | 0x20) => ServiceKind::Tv,
+            Some(0x02 | 0x07 | 0x0A) => ServiceKind::Radio,
+            Some(0x03 | 0x0C | 0x10 | 0x80..=0xFE) => ServiceKind::Data,
+            Some(_) => ServiceKind::Unknown,
+            None => ServiceKind::Unknown,
+        }
+    }
 }
 
 /// Tuning parameters stored alongside a capture's service list.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TuneRecord {
     pub frequency_mhz: u32,
     pub polarity: String,
@@ -33,6 +101,18 @@ pub struct TuneRecord {
     pub delivery_system: String,
     pub modulation: String,
     pub fec: String,
+    /// Satellite catalogue name (satellite captures; absent in older sidecars).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub satellite: Option<String>,
+    /// `tsp --lnb` value used for the capture.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lnb: Option<String>,
+    /// DiSEqC port used for the capture.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub satellite_number: Option<u32>,
+    /// Model of the tuner that made the capture (e.g. "TBS5530").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tuner_model: Option<String>,
 }
 
 /// Per-TP `services.json` payload written next to `capture.ts`.
@@ -226,6 +306,22 @@ pub fn analyze_file(paths: &TsduckPaths, path: &str) -> anyhow::Result<StreamSum
                     .get("is-scrambled")
                     .and_then(|x| x.as_bool())
                     .unwrap_or(false),
+                service_type: s
+                    .get("type")
+                    .and_then(|x| x.as_u64())
+                    .and_then(|t| u8::try_from(t).ok()),
+                pcr_pid: s
+                    .get("pcr-pid")
+                    .and_then(|x| x.as_u64())
+                    .and_then(|v| u16::try_from(v).ok())
+                    .filter(|&v| v < 0x1FFF),
+                components: s
+                    .get("components")
+                    .and_then(|c| c.get("total"))
+                    .and_then(|x| x.as_u64())
+                    .and_then(|v| u32::try_from(v).ok()),
+                has_video: media_flags(s, &v).0,
+                has_audio: media_flags(s, &v).1,
             });
         }
     }
@@ -286,6 +382,22 @@ fn services_from_analyze_value(v: &serde_json::Value) -> Vec<ServiceInfo> {
                     .get("is-scrambled")
                     .and_then(|x| x.as_bool())
                     .unwrap_or(false),
+                service_type: s
+                    .get("type")
+                    .and_then(|x| x.as_u64())
+                    .and_then(|t| u8::try_from(t).ok()),
+                pcr_pid: s
+                    .get("pcr-pid")
+                    .and_then(|x| x.as_u64())
+                    .and_then(|v| u16::try_from(v).ok())
+                    .filter(|&v| v < 0x1FFF),
+                components: s
+                    .get("components")
+                    .and_then(|c| c.get("total"))
+                    .and_then(|x| x.as_u64())
+                    .and_then(|v| u32::try_from(v).ok()),
+                has_video: media_flags(s, &v).0,
+                has_audio: media_flags(s, &v).1,
             })
         })
         .collect()
@@ -353,6 +465,7 @@ mod tests {
                 name: "(unknown)".into(),
                 provider: "".into(),
                 scrambled: false,
+                ..Default::default()
             }],
         };
         assert!(!empty.has_named_services());
@@ -365,6 +478,7 @@ mod tests {
                 name: "TRT1 HD".into(),
                 provider: "TRT".into(),
                 scrambled: false,
+                ..Default::default()
             }],
         };
         assert!(named.has_named_services());

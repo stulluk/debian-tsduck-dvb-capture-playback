@@ -9,6 +9,7 @@ mod analyze;
 mod bench;
 mod cable;
 mod cable_capture;
+mod channel_scan;
 mod channels;
 mod channels_import;
 mod config;
@@ -20,23 +21,18 @@ mod progress;
 mod refdb;
 mod satellites;
 mod sat_capture;
-mod scan;
 mod signal;
 mod terr_capture;
 mod terrestrial;
 mod tools;
 mod transponders;
-mod ts_pcr;
 mod tsduck;
 mod tui;
 mod usb;
 mod session;
 mod lastlog;
+mod loopback_compare;
 mod watch;
-mod watch_gst;
-mod watch_pipe;
-mod watch_pipeline;
-mod watch_test;
 mod web;
 
 use anyhow::Context;
@@ -83,9 +79,13 @@ enum Commands {
     UpdateSatellitesJson(UpdateSatellitesJsonArgs),
     /// Loopback test: DTU-315 plays a file, a tuner re-captures it.
     Loopback(LoopbackArgs),
+    /// Compare a source TS with its loopback re-capture (L2a link, L2b structure, L2c ES).
+    Compare(CompareArgs),
     /// Analyze a transport-stream file: TS id, bitrate, service list.
     Analyze(AnalyzeArgs),
-    /// Watch a live FTA service: tuner -> tsp zap -> ffmpeg -> media player.
+    /// Scan for channels (satellite TPs, UHF band, cable frequencies) and optionally save them.
+    Scan(ScanArgs),
+    /// Watch a live FTA service: tuner -> tsp zap -> mpv / vlc.
     Watch(WatchArgs),
     /// Start the local web interface (browser UI on localhost).
     Serve(ServeArgs),
@@ -95,6 +95,59 @@ enum Commands {
         #[arg(value_enum)]
         shell: Shell,
     },
+}
+
+/// Arguments for the `scan` subcommand.
+#[derive(clap::Args)]
+struct ScanArgs {
+    /// Satellite name from satellites.json (scans its transponders).
+    #[arg(long, conflicts_with_all = ["terrestrial", "cable"])]
+    satellite: Option<String>,
+    /// Only these TPs of the satellite: frequency or frequency+polarity (e.g. 10719v). Repeatable.
+    #[arg(long = "tp")]
+    tps: Vec<String>,
+    /// Scan terrestrial (DVB-T2, then DVB-T); whole UHF band 21-69 unless --frequency-mhz.
+    #[arg(long)]
+    terrestrial: bool,
+    /// Scan cable at the given --frequency-mhz values.
+    #[arg(long)]
+    cable: bool,
+    /// Frequencies in MHz (terrestrial/cable). Repeatable.
+    #[arg(long = "frequency-mhz")]
+    frequencies_mhz: Vec<u32>,
+    /// Terrestrial channel bandwidth in MHz.
+    #[arg(long, default_value_t = 8)]
+    bandwidth_mhz: u8,
+    /// Cable symbol rate in kSymbols/s.
+    #[arg(long, default_value_t = 6875)]
+    symbol_rate_ksps: u32,
+    /// Cable modulation (tsp value).
+    #[arg(long, default_value = "256-QAM")]
+    modulation: String,
+    /// Tuner device `/dev/dvb/adapterA[:F]` (default: auto by delivery).
+    #[arg(long)]
+    device_name: Option<String>,
+    /// Seconds to listen per frequency after lock.
+    #[arg(long, default_value_t = 5)]
+    listen: u32,
+    /// Seconds to wait for lock per frequency.
+    #[arg(long, default_value_t = 5)]
+    signal_timeout: u32,
+    /// Also keep scrambled services.
+    #[arg(long)]
+    include_scrambled: bool,
+    /// Skip radio services.
+    #[arg(long)]
+    no_radio: bool,
+    /// Add the found channels to channels.json.
+    #[arg(long)]
+    save: bool,
+    /// With --save: first remove saved channels of the same delivery (and satellite).
+    #[arg(long)]
+    replace: bool,
+    /// Print results as JSON.
+    #[arg(long)]
+    json: bool,
 }
 
 /// Arguments for the `serve` subcommand.
@@ -259,13 +312,10 @@ struct WatchArgs {
     /// Signal-lock timeout in seconds.
     #[arg(long, default_value_t = watch::WATCH_SIGNAL_TIMEOUT_S)]
     signal_timeout: u32,
-    /// Media player command that reads MPEG-TS from stdin.
-    #[arg(long, default_value = "mpv --force-window=yes --title=dvbhub --cache=yes --demuxer-readahead-secs=0 --msg-level=cplayer=v,ffmpeg=v -")]
-    player: String,
-    /// Transcode audio to AAC (needed for HLS/browser; mpv plays MP2 as-is).
+    /// Player command reading MPEG-TS from stdin (default: mpv, else vlc).
     #[arg(long)]
-    transcode_audio: bool,
-    /// Video only: do not open an audio sink (avoids broken PipeWire blocking playback).
+    player: Option<String>,
+    /// Video only: do not open an audio output (works around a broken audio stack).
     #[arg(long)]
     no_audio: bool,
     /// Print the assembled tsp command without running it.
@@ -277,13 +327,11 @@ struct WatchArgs {
     /// Channel name from ~/.config/dvbhub/channels.json (non-TUI playback).
     #[arg(long)]
     channel: Option<String>,
-    /// Headless automated test: null vo/ao, stop after --duration seconds.
+    /// Headless check: decode video with ffmpeg for --duration seconds and
+    /// fail unless frames arrive in real time.
     #[arg(long)]
     test: bool,
-    /// Compare PCR vs video PTS vs wall clock for --duration seconds (implies --test).
-    #[arg(long)]
-    sync_test: bool,
-    /// Playback duration for --test mode (seconds).
+    /// Duration of --test in seconds.
     #[arg(long, default_value_t = 30)]
     duration: u32,
 }
@@ -351,20 +399,34 @@ struct LoopbackArgs {
     /// Input transport-stream file played out by the DTU-315.
     #[arg(long)]
     input: String,
-    /// Loopback L-band IF frequency in MHz.
+    /// satellite (default), terrestrial or cable.
+    #[arg(long, default_value = "satellite")]
+    delivery: String,
+    /// Satellite: L-band IF in MHz (the tuner gets it with --lnb 0).
     #[arg(long, default_value_t = 1200)]
     if_mhz: u32,
-    /// Dektec modulation token, e.g. DVB-S2-8PSK.
+    /// Terrestrial / cable: RF frequency in MHz.
+    #[arg(long, default_value_t = 618)]
+    frequency_mhz: u32,
+    /// Dektec modulation token: DVB-S2-8PSK, DVB-S2-QPSK, DVB-S-QPSK, DVB-T2, DVB-T, 256-QAM, 64-QAM …
     #[arg(long, default_value = "DVB-S2-8PSK")]
     modulation: String,
-    /// Symbol rate in kSymbols/s.
+    /// Symbol rate in kSymbols/s (satellite, cable).
     #[arg(long, default_value_t = 30000)]
     symbol_rate_ksps: u32,
-    /// Convolutional/code rate, e.g. 3/4.
-    #[arg(long, default_value = "3/4")]
-    code_rate: String,
-    /// Capturing tuner device name. If omitted, the TBS5530 S/S2 frontend is
-    /// auto-detected via device discovery.
+    /// Code rate (satellite FEC, DVB-T2 PLP code rate). Default: 3/4 satellite, 2/3 terrestrial.
+    #[arg(long)]
+    code_rate: Option<String>,
+    /// Terrestrial bandwidth in MHz.
+    #[arg(long, default_value_t = 8)]
+    bandwidth_mhz: u8,
+    /// Terrestrial guard interval.
+    #[arg(long, default_value = "19/256")]
+    guard_interval: String,
+    /// Terrestrial constellation (DVB-T) / PLP modulation (DVB-T2).
+    #[arg(long, default_value = "64-QAM")]
+    plp_modulation: String,
+    /// Capturing tuner device (default: auto by delivery).
     #[arg(long)]
     tuner_device: Option<String>,
     /// Seconds the modulator warms up before the capture tunes.
@@ -376,9 +438,26 @@ struct LoopbackArgs {
     /// Output transport-stream file path for the re-captured stream.
     #[arg(long)]
     output: String,
+    /// Skip the L2a/L2b/L2c comparison.
+    #[arg(long)]
+    no_compare: bool,
     /// Print both tsp commands without running them.
     #[arg(long)]
     dry_run: bool,
+}
+
+/// Arguments for the `compare` subcommand.
+#[derive(clap::Args)]
+struct CompareArgs {
+    /// Source transport stream (what the modulator played).
+    #[arg(long)]
+    source: String,
+    /// Re-captured transport stream.
+    #[arg(long)]
+    capture: String,
+    /// Print the report as JSON.
+    #[arg(long)]
+    json: bool,
 }
 
 /// Program entry point.
@@ -406,6 +485,8 @@ fn main_inner() -> anyhow::Result<()> {
         Commands::UpdateSatellitesJson(args) => cmd_update_satellites_json(args),
         Commands::Loopback(args) => cmd_loopback(args),
         Commands::Analyze(args) => cmd_analyze(args),
+        Commands::Compare(args) => cmd_compare(args),
+        Commands::Scan(args) => cmd_scan(args),
         Commands::Watch(args) => cmd_watch(args),
         Commands::Serve(args) => web::serve_blocking(&args.bind, args.port),
         Commands::Completions { shell } => cmd_completions(shell),
@@ -654,9 +735,10 @@ fn cmd_capture_full_satellite(paths: &TsduckPaths, args: &CaptureArgs) -> anyhow
 
     let locked = report.outcomes.iter().filter(|o| o.run.ever_locked).count();
     eprintln!(
-        "[dvbhub] Finished: {}/{} transponders locked",
+        "[dvbhub] Finished: {}/{} transponders locked, {} skipped or failed",
         locked,
-        report.outcomes.len()
+        report.outcomes.len(),
+        report.skipped
     );
     Ok(())
 }
@@ -774,10 +856,11 @@ fn cmd_capture_catalogue_tp(
     )?;
 
     eprintln!(
-        "[dvbhub] Done: locked={} success={} file={}",
+        "[dvbhub] Done: locked={} success={} file={} services={}",
         outcome.run.ever_locked,
         outcome.run.success,
-        outcome.ts_path.display()
+        outcome.ts_path.display(),
+        outcome.services_path.display()
     );
     if !outcome.run.success {
         anyhow::bail!("capture failed");
@@ -984,84 +1067,187 @@ fn cmd_watch(args: WatchArgs) -> anyhow::Result<()> {
     if args.tui {
         return tui::run_watch_tui(paths);
     }
+    let opts = watch::WatchOpts {
+        player_cmd: args.player.clone(),
+        no_audio: args.no_audio,
+        test_secs: args.test.then_some(args.duration),
+        title: None,
+    };
 
-    if args.sync_test || args.test || args.channel.is_some() {
-        let name = args
-            .channel
-            .as_deref()
-            .ok_or_else(|| anyhow::anyhow!("--channel NAME is required with --test/--sync-test"))?;
-        let duration = if args.sync_test && args.duration == 30 {
-            10
-        } else {
-            args.duration
+    let end = if let Some(name) = args.channel.as_deref() {
+        let ch = channels::ChannelDb::load().find_by_name(name)?;
+        let opts = watch::WatchOpts {
+            title: Some(ch.name.clone()),
+            ..opts.clone()
         };
-        let report = watch_test::run_channel_test(
-            &paths,
-            name,
-            duration,
-            args.transcode_audio,
-            args.sync_test || args.test,
-        )?;
-        if (args.test || args.sync_test) && !report.passed() {
-            anyhow::bail!(
-                "watch test failed — see {} (max_time={:.2}s video_bufs={})",
-                lastlog::path().display(),
-                report.max_time_pos,
-                report.max_est_frames
-            );
+        if args.dry_run {
+            let discovery = devices::discover(&paths)?;
+            let device = watch::resolve_watch_device(&ch, &discovery)?;
+            let tsp_args = watch::watch_tsp_args(&ch, &device, args.signal_timeout)?;
+            println!("{}", watch::describe_pipeline(&tsp_args, &watch::player_argv(&opts)?));
+            return Ok(());
         }
-        return Ok(());
-    }
-
-    let service = args
-        .service
-        .ok_or_else(|| anyhow::anyhow!("--service SID, --channel, or --tui is required"))?;
-
-    if args.dry_run {
+        let discovery = devices::discover(&paths)?;
+        watch::watch_channel(&paths, &ch, &discovery, &opts)?
+    } else {
+        let service = args
+            .service
+            .ok_or_else(|| anyhow::anyhow!("--service SID, --channel NAME or --tui is required"))?;
         let params = watch_params(&args)?;
         let mut tsp_args = params.to_tsp_args();
         if let Some(i) = tsp_args.iter().position(|a| a == "-O") {
             tsp_args.truncate(i);
         }
-        tsp_args.extend([
-            "-P".into(),
-            "zap".into(),
-            service.to_string(),
-        ]);
-        println!(
-            "{} -O file | {}",
-            tsduck::display_command("tsp", &tsp_args),
-            watch::build_fork_cmd(&args.player, args.transcode_audio)
-        );
-        return Ok(());
-    }
+        tsp_args.extend(["-P".into(), "zap".into(), service.to_string()]);
+        if args.dry_run {
+            println!("{}", watch::describe_pipeline(&tsp_args, &watch::player_argv(&opts)?));
+            return Ok(());
+        }
+        let opts = watch::WatchOpts {
+            title: Some(format!("service {service}")),
+            ..opts
+        };
+        watch::run_watch(&paths, &tsp_args, &opts)?
+    };
 
-    let params = watch_params(&args)?;
-    let mut tsp_args = params.to_tsp_args();
-    if let Some(i) = tsp_args.iter().position(|a| a == "-O") {
-        tsp_args.truncate(i);
+    if let Some(err) = &end.tsp_error {
+        anyhow::bail!("watch failed: {err}");
     }
-    tsp_args.extend([
-        "-P".into(),
-        "zap".into(),
-        service.to_string(),
-    ]);
+    if let Some(report) = &end.test {
+        eprintln!("[dvbhub] watch test: {}", report.summary());
+        if !report.passed(args.duration) {
+            anyhow::bail!("watch test FAILED — see {}", lastlog::path().display());
+        }
+        eprintln!("[dvbhub] watch test PASSED");
+    }
+    Ok(())
+}
 
-    let end = watch::run_tsp_watch(
-        &paths,
-        tsp_args,
-        watch::WatchOpts {
-            transcode_audio: args.transcode_audio,
-            audio: if args.no_audio {
-                watch_gst::WatchAudioMode::None
+/// Implements the `scan` subcommand.
+fn cmd_scan(args: ScanArgs) -> anyhow::Result<()> {
+    use channel_scan::{ScanEvent, ScanOptions};
+    use devices::DeliveryCategory;
+
+    let paths = TsduckPaths::resolve()?;
+    let discovery = devices::discover(&paths)?;
+    let cat = if args.terrestrial {
+        DeliveryCategory::Terrestrial
+    } else if args.cable {
+        DeliveryCategory::Cable
+    } else if args.satellite.is_some() {
+        DeliveryCategory::Satellite
+    } else {
+        anyhow::bail!("choose --satellite NAME, --terrestrial or --cable");
+    };
+    let tuner = discovery.tuner_for(cat, None);
+    let device = match (&args.device_name, tuner) {
+        (Some(d), _) => d.clone(),
+        (None, Some(t)) => t.capture_address(cat),
+        (None, None) => anyhow::bail!("no {} tuner found", cat.as_str()),
+    };
+    let model = tuner.map(|t| t.label.clone());
+
+    let targets = match cat {
+        DeliveryCategory::Satellite => {
+            let name = args.satellite.as_deref().unwrap_or_default();
+            let db = satellites::SatelliteDb::load();
+            let sat = db
+                .satellites
+                .iter()
+                .find(|s| s.name.eq_ignore_ascii_case(name))
+                .ok_or_else(|| anyhow::anyhow!("satellite not in catalogue: {name}"))?;
+            channel_scan::satellite_targets(sat, &device, model.as_deref(), &args.tps)
+        }
+        DeliveryCategory::Terrestrial => channel_scan::terrestrial_targets(
+            &device,
+            model.as_deref(),
+            &args.frequencies_mhz,
+            args.bandwidth_mhz,
+        ),
+        DeliveryCategory::Cable => {
+            anyhow::ensure!(!args.frequencies_mhz.is_empty(), "--cable needs --frequency-mhz");
+            channel_scan::cable_targets(
+                &device,
+                model.as_deref(),
+                &args.frequencies_mhz,
+                args.symbol_rate_ksps,
+                &args.modulation,
+            )
+        }
+    };
+    anyhow::ensure!(!targets.is_empty(), "nothing to scan (check --tp filters)");
+    let opts = ScanOptions {
+        listen_secs: args.listen,
+        signal_timeout_s: args.signal_timeout,
+        include_scrambled: args.include_scrambled,
+        include_radio: !args.no_radio,
+    };
+    eprintln!(
+        "[dvbhub] Scanning {} target(s) on {device}{}",
+        targets.len(),
+        model.as_deref().map(|m| format!(" ({m})")).unwrap_or_default()
+    );
+    let cancel = std::sync::atomic::AtomicBool::new(false);
+    let results = channel_scan::scan(&paths, &targets, &opts, &cancel, |ev| {
+        if let ScanEvent::TargetDone { total, result } = ev {
+            let status = if result.locked {
+                format!(
+                    "LOCK {} SNR {} — {} services, {} kept",
+                    result.delivery_system.as_deref().unwrap_or(""),
+                    result.snr_db.map(|v| format!("{v:.1} dB")).unwrap_or_else(|| "n/a".into()),
+                    result.services.len(),
+                    result.wanted_count(&opts)
+                )
             } else {
-                watch_gst::WatchAudioMode::from_env()
-            },
-            ..Default::default()
-        },
-    )?;
-    if !end.success() {
-        anyhow::bail!("watch failed — see {}", lastlog::path().display());
+                "no lock".to_string()
+            };
+            eprintln!("[dvbhub] {}/{} {:<22} {status}", result.index + 1, total, result.label);
+        }
+    });
+    let channels = channel_scan::channels_from_results(&results, &targets, &opts);
+    let locked = results.iter().filter(|r| r.locked).count();
+
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "results": results,
+                "channels": channels,
+            }))?
+        );
+    } else {
+        for ch in &channels {
+            println!("{}", ch.list_label());
+        }
+    }
+    eprintln!(
+        "[dvbhub] Scan done: {locked}/{} locked, {} channel(s) found",
+        results.len(),
+        channels.len()
+    );
+
+    if args.save {
+        let mut db = channels::ChannelDb::load();
+        let delivery = targets[0].delivery.clone();
+        if args.replace {
+            let sat = targets[0].satellite.clone();
+            db.channels.retain(|c| !(c.delivery == delivery && c.satellite == sat));
+        }
+        let base = db.channels.iter().map(|c| c.scan_index).max().unwrap_or(0);
+        let batch: Vec<_> = channels
+            .into_iter()
+            .enumerate()
+            .map(|(i, mut c)| {
+                c.scan_index = base + 1 + i as u32;
+                c
+            })
+            .collect();
+        let added = db.add_batch(batch);
+        db.save()?;
+        eprintln!(
+            "[dvbhub] Saved {added} new channel(s) to {}",
+            config::channels_file_path().display()
+        );
     }
     Ok(())
 }
@@ -1200,55 +1386,56 @@ fn cmd_playout(args: PlayoutArgs) -> anyhow::Result<()> {
 
 /// Implements the `loopback` subcommand: play out via DTU-315 and re-capture.
 fn cmd_loopback(args: LoopbackArgs) -> anyhow::Result<()> {
+    use devices::DeliveryCategory;
     let paths = TsduckPaths::resolve()?;
-    let frequency_hz = args.if_mhz as u64 * 1_000_000;
+    let cat = match args.delivery.to_ascii_lowercase().as_str() {
+        "satellite" | "sat" => DeliveryCategory::Satellite,
+        "terrestrial" | "ter" => DeliveryCategory::Terrestrial,
+        "cable" | "cab" => DeliveryCategory::Cable,
+        other => anyhow::bail!("unknown --delivery {other:?}"),
+    };
+    let form = refdb::ReferenceCapture {
+        name: String::new(),
+        file: args.input.clone(),
+        delivery: cat.as_str().into(),
+        frequency_mhz: if cat == DeliveryCategory::Satellite {
+            args.if_mhz
+        } else {
+            args.frequency_mhz
+        },
+        modulation: args.modulation.clone(),
+        symbol_rate_ksps: args.symbol_rate_ksps,
+        code_rate: args.code_rate.clone().unwrap_or_else(|| {
+            if cat == DeliveryCategory::Terrestrial { "2/3" } else { "3/4" }.into()
+        }),
+        bandwidth_mhz: Some(args.bandwidth_mhz),
+        guard_interval: Some(args.guard_interval.clone()),
+        plp_modulation: Some(args.plp_modulation.clone()),
+        j83: None,
+        level: None,
+        // Stay attached for the whole capture: a detached playout stops once
+        // the on-board FIFO drains, breaking the lock.
+        infinite: true,
+    };
+    let play = form.to_play_params(args.input.clone())?;
 
-    let (delivery_system, dvb_modulation) =
-        pipeline::dvb_from_dektec_modulation(&args.modulation).ok_or_else(|| {
-            anyhow::anyhow!("unsupported modulation token for loopback: {}", args.modulation)
-        })?;
-
-    // Resolve the re-capturing tuner: explicit flag, else auto-detect.
     let tuner_device = match &args.tuner_device {
         Some(d) => d.clone(),
-        None => {
-            let discovery = devices::discover(&paths)?;
-            discovery.satellite_tuner_address().ok_or_else(|| {
-                anyhow::anyhow!(
-                    "no satellite tuner found for loopback; pass --tuner-device explicitly"
-                )
-            })?
-        }
+        None => devices::discover(&paths)?
+            .tuner_for(cat, None)
+            .map(|d| d.capture_address(cat))
+            .ok_or_else(|| anyhow::anyhow!("no {} tuner found; pass --tuner-device", cat.as_str()))?,
     };
-
-    let play = PlayParams {
-        input: args.input.clone(),
-        infinite: true,
-        delivery: pipeline::PlayoutDelivery::Satellite,
-        frequency_hz,
-        modulation: args.modulation.clone(),
-        symbol_rate: Some(args.symbol_rate_ksps as u64 * 1_000),
-        code_rate: Some(args.code_rate.clone()),
-        bandwidth_hz: None,
-        guard_interval: None,
-        plp_modulation: None,
-        j83: None,
-        level_dbm_tenths: None,
-        // Stay attached for the whole capture: a detached playout would stop
-        // transmitting once the on-board FIFO drains, breaking the lock.
-        instant_detach: false,
-    };
-    let capture = CaptureParams {
+    let mut capture = CaptureParams {
         device_name: Some(tuner_device.clone()),
         adapter: None,
-        delivery_system: delivery_system.to_string(),
-        frequency_hz,
-        polarity: Some("vertical".to_string()),
-        symbol_rate: Some(args.symbol_rate_ksps as u64 * 1_000),
-        modulation: Some(dvb_modulation.to_string()),
-        fec: Some(args.code_rate.clone()),
-        // Direct L-band injection: bypass LNB local-oscillator subtraction.
-        lnb: Some("0".to_string()),
+        delivery_system: String::new(),
+        frequency_hz: play.frequency_hz,
+        polarity: None,
+        symbol_rate: None,
+        modulation: None,
+        fec: None,
+        lnb: None,
         satellite_number: None,
         bandwidth_hz: None,
         guard_interval: None,
@@ -1259,10 +1446,33 @@ fn cmd_loopback(args: LoopbackArgs) -> anyhow::Result<()> {
         output: args.output.clone(),
         live_analyze: false,
     };
+    match cat {
+        DeliveryCategory::Satellite => {
+            let (sys, modu) = pipeline::dvb_from_dektec_modulation(&args.modulation)
+                .ok_or_else(|| anyhow::anyhow!("unsupported satellite modulation {}", args.modulation))?;
+            capture.delivery_system = sys.into();
+            capture.modulation = Some(modu.into());
+            capture.polarity = Some("vertical".into());
+            capture.symbol_rate = play.symbol_rate;
+            capture.fec = play.code_rate.clone();
+            // Direct L-band injection: no LNB local-oscillator subtraction.
+            capture.lnb = Some("0".into());
+        }
+        DeliveryCategory::Terrestrial => {
+            let t2 = args.modulation.eq_ignore_ascii_case("DVB-T2");
+            capture.delivery_system = if t2 { "DVB-T2" } else { "DVB-T" }.into();
+            capture.bandwidth_hz = play.bandwidth_hz;
+            capture.plp = t2.then_some(0);
+        }
+        DeliveryCategory::Cable => {
+            capture.delivery_system = "DVB-C".into();
+            capture.symbol_rate = play.symbol_rate;
+            capture.modulation = Some(args.modulation.clone());
+        }
+    }
 
     let play_args = play.to_tsp_args();
     let capture_args = capture.to_tsp_args();
-
     if args.dry_run {
         println!("# 1) DTU-315 playout (background, --infinite):");
         println!("{}", tsduck::display_command("tsp", &play_args));
@@ -1271,34 +1481,46 @@ fn cmd_loopback(args: LoopbackArgs) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    println!("Starting DTU-315 playout (attached, infinite)...");
-    let mut play_child = tsduck::tool_command(&paths, "tsp")
-        .args(&play_args)
-        .spawn()?;
-
-    // Give the modulator time to come up before tuning the receiver.
+    println!("Starting DTU-315 playout ({}, attached, infinite)…", cat.as_str());
+    let mut play_child = tsduck::tool_command(&paths, "tsp").args(&play_args).spawn()?;
     sleep(Duration::from_secs(args.warmup));
-
-    println!("Capturing from {} for {}s...", tuner_device, args.seconds);
+    if let Ok(Some(status)) = play_child.try_wait() {
+        anyhow::bail!("playout stopped during warm-up ({status}) — see the tsp output above");
+    }
+    println!("Capturing from {tuner_device} for {}s…", args.seconds);
     let capture_result = tsduck::run_inherit(&paths, "tsp", &capture_args);
-
-    // Always stop the playout, regardless of capture outcome.
     let _ = play_child.kill();
     let _ = play_child.wait();
-
-    let ok = capture_result?;
-    if !ok {
-        anyhow::bail!("loopback capture failed (see tsp output above)");
-    }
+    anyhow::ensure!(capture_result?, "loopback capture failed (see tsp output above)");
     println!("Loopback capture written to {}", args.output);
 
-    match analyze::analyze_file(&paths, &args.output) {
-        Ok(summary) => {
-            println!("Re-captured stream:");
-            summary.print_human("  ");
-        }
-        Err(e) => eprintln!("  ! analyze failed: {e}"),
+    if args.no_compare {
+        return Ok(());
     }
-    println!("Next: compare elementary streams with tscmp / tsanalyze (L2a/b/c).");
+    println!("Comparing with the source (L2a / L2b / L2c)…");
+    let report = loopback_compare::compare(
+        &paths,
+        std::path::Path::new(&args.input),
+        std::path::Path::new(&args.output),
+    )?;
+    report.print();
+    anyhow::ensure!(report.pass(), "loopback comparison FAILED");
+    Ok(())
+}
+
+/// Implements the `compare` subcommand.
+fn cmd_compare(args: CompareArgs) -> anyhow::Result<()> {
+    let paths = TsduckPaths::resolve()?;
+    let report = loopback_compare::compare(
+        &paths,
+        std::path::Path::new(&args.source),
+        std::path::Path::new(&args.capture),
+    )?;
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        report.print();
+    }
+    anyhow::ensure!(report.pass(), "comparison FAILED");
     Ok(())
 }

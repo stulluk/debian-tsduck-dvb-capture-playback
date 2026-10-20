@@ -12,7 +12,6 @@ use std::sync::{Arc, atomic::AtomicBool};
 /// Outcome of one terrestrial capture.
 #[derive(Debug)]
 pub struct TerrCaptureOutcome {
-    pub mux: TerrestrialMux,
     pub run: CaptureRun,
     pub ts_path: PathBuf,
     pub services_path: PathBuf,
@@ -67,7 +66,6 @@ pub fn capture_mux(
     }
 
     Ok(TerrCaptureOutcome {
-        mux: mux.clone(),
         run,
         ts_path,
         services_path,
@@ -85,5 +83,6 @@ fn tune_record_from_mux(mux: &TerrestrialMux) -> TuneRecord {
             .clone()
             .unwrap_or_else(|| "64-QAM".into()),
         fec: mux.fec.clone().unwrap_or_else(|| "2/3".into()),
+        ..Default::default()
     }
 }
