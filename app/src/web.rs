@@ -242,6 +242,7 @@ async fn api_config_get(State(state): State<AppState>) -> Response {
         "capture_seconds": cfg.capture_seconds,
         "web_quality": cfg.web_quality,
         "web_qualities": crate::config::WEB_QUALITIES,
+        "web_gpu_encode": cfg.web_gpu_encode,
         "config_file": crate::config::config_file_path().to_string_lossy(),
         "log_file": crate::config::log_file_path().to_string_lossy(),
         "hls_dir": session::hls_root().to_string_lossy(),
@@ -253,11 +254,17 @@ async fn api_config_get(State(state): State<AppState>) -> Response {
 struct ConfigUpdate {
     capture_dir: Option<String>,
     web_quality: Option<String>,
+    web_gpu_encode: Option<bool>,
 }
 
 async fn api_config_set(State(state): State<AppState>, Json(req): Json<ConfigUpdate>) -> Response {
     if let Some(q) = &req.web_quality {
         if let Err(e) = state.sessions.set_web_quality(q).await {
+            return bad_request(e);
+        }
+    }
+    if let Some(gpu) = req.web_gpu_encode {
+        if let Err(e) = state.sessions.set_web_gpu_encode(gpu).await {
             return bad_request(e);
         }
     }
@@ -274,6 +281,7 @@ async fn api_config_set(State(state): State<AppState>, Json(req): Json<ConfigUpd
         "ok": true,
         "capture_dir": cfg.capture_dir.to_string_lossy(),
         "web_quality": cfg.web_quality,
+        "web_gpu_encode": cfg.web_gpu_encode,
     }))
     .into_response()
 }

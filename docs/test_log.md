@@ -368,3 +368,14 @@ slower than the channel (a single service cut out of a mux) was transmitted up t
 not an option; dvbhub now measures the channel bitrate (short null playout) and the
 file's PCR bitrate and interleaves null packets with `--add-input-stuffing N/1000`.
 Files faster than the channel are rejected with a clear message.
+
+## 2026-10-20 — GPU resets with VAAPI "Source" playback
+
+- Symptom: KWin "crashed" notifications while watching HotBird 4K1 in Chrome with
+  the VAAPI Source encoder.
+- Kernel: `amdgpu [gfxhub] page fault … Process chrome`, then `ring gfx_0.x timeout`
+  (also naming kwin_wayland) and `GPU reset … succeeded` at 18:44 and 18:45. Chrome:
+  "GPU process exited unexpectedly: exit_code=133". KWin: `GL_CONTEXT_LOST`.
+- Correlation with `dvbhub.log`: all faults occurred during `encoder=h264_vaapi`
+  sessions; the x264 Source session (18:30–18:39, same channel, same Chrome) had none.
+- Fix: GPU encoding is now opt-in (`web_gpu_encode`, Settings checkbox, default off).

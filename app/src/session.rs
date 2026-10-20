@@ -258,6 +258,21 @@ impl SessionManager {
         Ok(())
     }
 
+    /// Enables or disables (and persists) GPU encoding for the "source" quality.
+    pub async fn set_web_gpu_encode(&self, enabled: bool) -> anyhow::Result<()> {
+        let cfg = {
+            let mut c = self.config.write().await;
+            c.web_gpu_encode = enabled;
+            c.clone()
+        };
+        tokio::task::spawn_blocking(move || cfg.save())
+            .await
+            .map_err(|e| anyhow::anyhow!("config save task failed: {e}"))?
+            .context("failed to persist config")?;
+        self.action(format!("SETTINGS web_gpu_encode = {enabled}"));
+        Ok(())
+    }
+
     // ---- job slots -----------------------------------------------------
 
     fn new_job(&self, kind: &'static str) -> Job {
@@ -633,8 +648,12 @@ impl SessionManager {
         // segment start cleanly, so playback begins within a few seconds.
         // Audio is AAC (browsers cannot play MPEG-1/2 audio). Only the first
         // video and audio streams are mapped; teletext/data would break the muxer.
-        let quality = self.config.read().await.web_quality.clone();
-        let profile = web_video_args(&quality, vaapi_h264_available());
+        // GPU encoding is opt-in (`web_gpu_encode`): see AppConfig for why.
+        let (quality, gpu) = {
+            let c = self.config.read().await;
+            (c.web_quality.clone(), c.web_gpu_encode)
+        };
+        let profile = web_video_args(&quality, gpu && vaapi_h264_available());
         let (pre_input, video) = (profile.pre_input, profile.video);
         let ffmpeg = format!(
             "ffmpeg -hide_banner -loglevel error {pre_input} -fflags +genpts+discardcorrupt+nobuffer \

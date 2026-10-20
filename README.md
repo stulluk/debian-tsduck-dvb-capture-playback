@@ -280,11 +280,15 @@ from the browser.
 broadcast video is often interlaced open-GOP H.264 (no IDR frames, rejected by
 browser decoders), MPEG-2 (not playable in browsers at all) or 10-bit HEVC. The
 quality selector next to the player offers **720p** (default, x264, ≈ 0.5 core) or
-**Source** — the native resolution. With a VAAPI GPU (`/dev/dri/renderD128`,
-checked at start-up) Source decodes, deinterlaces and encodes entirely on the GPU
-at 25 fps: UHD 3840×2160 plays with ffmpeg at ≈ 5 % of one core instead of 6–10
-cores with x264 (which remains the fallback without VAAPI). An integrated GPU
-encodes UHD H.264 at only ~45–55 fps, hence 25 fps. Audio becomes AAC.
+**Source** — the native resolution, encoded with x264 (UHD 3840×2160 costs 6–10
+cores). Settings → "Encode Source quality on the GPU" (`web_gpu_encode` in
+`config.json`, off by default) moves Source to VAAPI (`/dev/dri/renderD128`,
+checked on first use): decode, deinterlace and encode on the GPU at 25 fps, UHD at
+≈ 5 % of one core (an integrated GPU encodes UHD H.264 at only ~45–55 fps, hence
+25 fps). It is opt-in because on the test PC (Radeon 610M iGPU, Mesa VAAPI) it
+caused amdgpu gfx ring page faults and GPU resets while Chrome played the stream;
+KWin then lost its GL context ("kwin crashed" notifications). The x264 path ran
+the same 4K channel for 9 minutes without a fault. Audio becomes AAC.
 
 ### Channel database
 

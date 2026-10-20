@@ -171,6 +171,11 @@ pub struct AppConfig {
     /// Browser playback quality: "720p" or "source" (native resolution).
     #[serde(default = "default_web_quality")]
     pub web_quality: String,
+    /// Encode the "source" quality on the GPU (VAAPI). Off by default: on the
+    /// Radeon 610M iGPU it triggered amdgpu gfx ring resets (KWin lost its GL
+    /// context) while Chrome played the stream.
+    #[serde(default)]
+    pub web_gpu_encode: bool,
 }
 
 fn default_capture_seconds() -> u32 {
@@ -190,6 +195,7 @@ impl Default for AppConfig {
             capture_dir: default_capture_dir(),
             capture_seconds: default_capture_seconds(),
             web_quality: default_web_quality(),
+            web_gpu_encode: false,
         }
     }
 }

@@ -119,6 +119,7 @@ async function loadSettings() {
   try {
     const c = await api("GET", "/api/config");
     $("#cfg-dir").value = c.capture_dir;
+    $("#cfg-gpu").checked = !!c.web_gpu_encode;
     $("#cfg-info").innerHTML = [
       ["Config file", c.config_file],
       ["Log file", c.log_file],
@@ -132,6 +133,15 @@ async function loadSettings() {
     toast(e.message, "err");
   }
 }
+
+$("#cfg-gpu").onchange = async (ev) => {
+  try {
+    await api("POST", "/api/config", { web_gpu_encode: ev.target.checked });
+    toast(`GPU encoding ${ev.target.checked ? "on" : "off"} (applies to the next channel start)`, "ok");
+  } catch (e) {
+    toast(e.message, "err");
+  }
+};
 
 $("#cfg-save").onclick = async () => {
   try {
