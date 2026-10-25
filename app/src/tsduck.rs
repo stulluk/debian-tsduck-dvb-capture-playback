@@ -12,11 +12,24 @@ use crate::lastlog;
 
 /// Runs a TSDuck tool with the given args, inheriting stdio (for live output),
 /// and returns whether it exited successfully.
+///
+/// The child gets SIGTERM when dvbhub dies for any reason (SIGTERM, SIGINT, even
+/// SIGKILL), so a `tsp` never outlives dvbhub and keeps holding the DTU-315
+/// (which made the next playout fail with `DTAPI_E_IN_USE`).
 pub fn run_inherit(paths: &TsduckPaths, tool: &str, args: &[String]) -> anyhow::Result<bool> {
+    use std::os::unix::process::CommandExt;
     lastlog::event("tsp", &format!("inherit {}", display_command(tool, args)));
     let bin = paths.tool(tool);
-    let status = Command::new(&bin)
-        .args(args)
+    let mut cmd = Command::new(&bin);
+    cmd.args(args);
+    // SAFETY: prctl is async-signal-safe and only affects the forked child.
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM);
+            Ok(())
+        });
+    }
+    let status = cmd
         .status()
         .with_context(|| format!("failed to launch {}", bin.display()))?;
     let ok = status.success();
